@@ -37,6 +37,15 @@
  * `sessions.compact` via the local `openclaw` CLI (see gateway.ts), because
  * the public plugin SDK exposes no in-process compaction call.
  *
+ * Timing (learned live 2026-11-13, 03:04 run): `sessions.compact` refuses
+ * while the session has an active run, and the agent_end that reports the
+ * primary failure fires mid-run, before the fallback leg finishes. So the
+ * compact attempt retries on "active run" (up to 4 attempts, 30s apart)
+ * instead of failing once — and the cooldown arms only on success, so a
+ * failed attempt never blocks the next run from retrying. The CLI's gateway
+ * timeout also defaults to 10s, far too short for a real compaction, so
+ * gateway.ts passes `--timeout 600000` on the compact call.
+ *
  * Safety:
  *   - Compaction only fires when a fallback model was observed (started or
  *     ended a call), a primary call failed, any call failed, or the run
@@ -410,17 +419,37 @@ export default definePluginEntry({
           }
 
           log(`session ${sessionKey}: compacting (${decision.reason})`);
-          lastCompactAt.set(sessionKey, now);
-          try {
-            const reply = await compactSession(sessionKey, {
-              cliPath,
-              timeoutMs: COMPACT_TIMEOUT_MS,
-            });
-            log(`session ${sessionKey}: compaction finished: ${reply.slice(0, 500)}`);
-          } catch (err) {
-            log(
-              `session ${sessionKey}: compaction failed (${err instanceof Error ? err.message : String(err)})`,
-            );
+          // sessions.compact refuses while the session still has an active
+          // run (INVALID_REQUEST "Session ... has an active run; retry after
+          // it finishes") — the agent_end that reports the primary failure
+          // fires mid-run, before the fallback leg finishes (learned live
+          // 2026-11-13, 03:04 run). Retry until the run ends instead of
+          // failing once. The cooldown arms ONLY on success: a failed
+          // attempt must not block the next run from retrying (v0.1.2 armed
+          // it on failure, so the 03:34 run would have skipped compaction).
+          const maxAttempts = 4;
+          let done = false;
+          for (let attempt = 1; attempt <= maxAttempts && !done; attempt++) {
+            try {
+              const reply = await compactSession(sessionKey, {
+                cliPath,
+                timeoutMs: COMPACT_TIMEOUT_MS,
+              });
+              lastCompactAt.set(sessionKey, Date.now());
+              log(`session ${sessionKey}: compaction finished: ${reply.slice(0, 500)}`);
+              done = true;
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              const activeRun = message.includes("active run");
+              if (activeRun && attempt < maxAttempts) {
+                log(
+                  `session ${sessionKey}: compaction blocked (active run), retry ${attempt}/${maxAttempts - 1} in 30s`,
+                );
+                await new Promise((resolve) => setTimeout(resolve, 30_000));
+              } else {
+                log(`session ${sessionKey}: compaction failed (${message})`);
+              }
+            }
           }
         } catch {
           // Observation must never break a run.

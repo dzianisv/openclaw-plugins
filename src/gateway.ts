@@ -49,7 +49,7 @@ export async function getSessionInputTokens(
 ): Promise<number | null> {
   const { stdout } = await runCli(
     opts.cliPath,
-    ["gateway", "call", "sessions.list", "--params", "{}", "--json"],
+    ["gateway", "call", "sessions.list", "--params", "{}", "--json", "--timeout", "30000"],
     opts.timeoutMs,
   );
   const parsed: unknown = JSON.parse(stdout);
@@ -87,6 +87,11 @@ export async function compactSession(
       "--params",
       JSON.stringify({ key: sessionKey }),
       "--json",
+      // The CLI's gateway timeout defaults to 10s; a real compaction is a
+      // model call on a huge session and takes far longer. Without this the
+      // CLI gives up while the gateway is still compacting.
+      "--timeout",
+      "600000",
     ],
     opts.timeoutMs,
   );
