@@ -60,17 +60,28 @@ Handlers never throw: a plugin error must never break an agent run.
 
 ## Install
 
+Published plugins ship built JavaScript; a git checkout needs one build
+first, and `plugins install` needs the gateway stopped (it requires
+exclusive offline state ownership):
+
 ```bash
-openclaw plugins install github:dzianisv/openclaw-failover-compact
-openclaw plugins enable failover-compact
+git clone https://github.com/dzianisv/openclaw-failover-compact.git
+cd openclaw-failover-compact
+npm install
+npm run build            # produces dist/index.js
 ```
 
-Or from a local checkout:
+Stop the gateway, link-install the plugin, start the gateway again:
 
 ```bash
+systemctl --user stop openclaw-gateway
 openclaw plugins install --link ./openclaw-failover-compact --force
 openclaw plugins enable failover-compact
+systemctl --user start openclaw-gateway
 ```
+
+Once the package is published to npm, the short form will be
+`openclaw plugins install openclaw-failover-compact`.
 
 Grant the plugin conversation-hook access in `openclaw.json`:
 
