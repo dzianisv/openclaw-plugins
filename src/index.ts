@@ -46,6 +46,14 @@
  * timeout also defaults to 10s, far too short for a real compaction, so
  * gateway.ts passes `--timeout 600000` on the compact call.
  *
+ * v0.1.4: the primary/fallback list is re-read from the runtime config on
+ * every agent_end, not just at registration. A config edit hot-reloads the
+ * plugin, but the re-registration reads a STALE runtime-config snapshot
+ * (the model list lags the edit by ~2 min on a loaded host), so a fallback
+ * swap used to need a forced `plugins reload` to take effect. Now the next
+ * run's tracking uses the fresh list. The token-count read also retries
+ * (3 attempts, 5s apart) after the 03:34 run's transient read failure.
+ *
  * Safety:
  *   - Compaction only fires when a fallback model was observed (started or
  *     ended a call), a primary call failed, any call failed, or the run
@@ -184,37 +192,53 @@ export default definePluginEntry({
     const cfg = rawConfig as PluginConfig;
 
     // Prefer the gateway's own primary/fallbacks when the runtime exposes them.
+    // v0.1.4: the runtime config is re-read on EVERY agent_end, not just at
+    // registration. Config edits hot-reload the plugin, but the re-registration
+    // reads a STALE runtime-config snapshot (the model list lags the edit by
+    // ~2 min on a loaded host), so a fallback swap only took effect after a
+    // forced `plugins reload`. Re-reading per run closes that lag: the next
+    // run's tracking uses the fresh list, no reload needed.
+    const readRuntimeModels = (): { primary: string | null; fallbacks: string[] } => {
+      try {
+        const runtimeConfig = (api as unknown as {
+          runtime?: { config?: { current?: () => unknown } };
+        }).runtime?.config?.current?.();
+        const configuredPrimary = readConfigPath(runtimeConfig, [
+          "agents",
+          "defaults",
+          "model",
+          "primary",
+        ]);
+        const configuredFallbacks = readConfigPath(runtimeConfig, [
+          "agents",
+          "defaults",
+          "model",
+          "fallbacks",
+        ]);
+        return {
+          primary:
+            typeof configuredPrimary === "string" && configuredPrimary.trim()
+              ? configuredPrimary.trim()
+              : null,
+          fallbacks: Array.isArray(configuredFallbacks)
+            ? configuredFallbacks.filter(
+                (m): m is string => typeof m === "string" && !!m.trim(),
+              )
+            : [],
+        };
+      } catch {
+        // Runtime config is best-effort; plugin config and defaults still apply.
+        return { primary: null, fallbacks: [] };
+      }
+    };
+
     let primaryModel = cfg.primaryModel?.trim() || DEFAULT_PRIMARY_MODEL;
     let fallbackModels: string[] = Array.isArray(cfg.fallbackModels)
       ? cfg.fallbackModels.filter((m): m is string => typeof m === "string" && !!m.trim())
       : [];
-    try {
-      const runtimeConfig = (api as unknown as {
-        runtime?: { config?: { current?: () => unknown } };
-      }).runtime?.config?.current?.();
-      const configuredPrimary = readConfigPath(runtimeConfig, [
-        "agents",
-        "defaults",
-        "model",
-        "primary",
-      ]);
-      if (typeof configuredPrimary === "string" && configuredPrimary.trim()) {
-        primaryModel = configuredPrimary.trim();
-      }
-      const configuredFallbacks = readConfigPath(runtimeConfig, [
-        "agents",
-        "defaults",
-        "model",
-        "fallbacks",
-      ]);
-      if (Array.isArray(configuredFallbacks)) {
-        fallbackModels = configuredFallbacks.filter(
-          (m): m is string => typeof m === "string" && !!m.trim(),
-        );
-      }
-    } catch {
-      // Runtime config is best-effort; plugin config and defaults still apply.
-    }
+    const runtimeModels = readRuntimeModels();
+    if (runtimeModels.primary) primaryModel = runtimeModels.primary;
+    if (runtimeModels.fallbacks.length > 0) fallbackModels = runtimeModels.fallbacks;
 
     const tokenThreshold =
       typeof cfg.tokenThreshold === "number" && cfg.tokenThreshold > 0
@@ -369,12 +393,20 @@ export default definePluginEntry({
                 : usage.anyCallFailed
                   ? "a model call failed"
                   : "the run reported failure";
+          // v0.1.4: re-read the runtime model list on every run so a fallback
+          // swap applies without a forced plugin reload. The next run's
+          // tracking uses this fresh list; this run's flags were tracked
+          // against the list live at its start.
+          const fresh = readRuntimeModels();
+          if (fresh.primary) primaryModel = fresh.primary;
+          if (fresh.fallbacks.length > 0) fallbackModels = fresh.fallbacks;
           const startedSummary = usage.started.join(",");
           const endedSummary = usage.ended
             .map((c) => `${c.model ?? "?"}:${c.failed ? "fail" : "ok"}`)
             .join(",");
           log(
             `session ${sessionKey} run ${runKey}: agent_end success=${String(readField(event, "success"))} ` +
+              `primary=${primaryModel} fallbacks=[${fallbackModels.join(", ")}] ` +
               `primaryStarted=${usage.primaryStarted} primaryFailed=${usage.primaryFailed} ` +
               `fallbackStarted=${usage.fallbackStarted} fallbackUsed=${usage.fallbackUsed} ` +
               `fallbackFailed=${usage.fallbackFailed} started=[${startedSummary}] ended=[${endedSummary}]`,
@@ -385,16 +417,32 @@ export default definePluginEntry({
           if (cached && now - cached.at < 60_000) {
             inputTokens = cached.tokens;
           } else {
-            try {
-              inputTokens = await getSessionInputTokens(sessionKey, {
-                cliPath,
-                timeoutMs: LIST_TIMEOUT_MS,
-              });
-              sizeCache.set(sessionKey, { tokens: inputTokens, at: now });
-            } catch (err) {
-              log(
-                `session ${sessionKey}: could not read token count (${err instanceof Error ? err.message : String(err)}); skipping`,
-              );
+            // v0.1.4: the token read failed transiently on the loaded host
+            // (03:34 run: "session token count unknown; refusing to guess"),
+            // so retry a few times before giving up.
+            inputTokens = null;
+            let lastError: unknown = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                inputTokens = await getSessionInputTokens(sessionKey, {
+                  cliPath,
+                  timeoutMs: LIST_TIMEOUT_MS,
+                });
+                sizeCache.set(sessionKey, { tokens: inputTokens, at: now });
+                lastError = null;
+                break;
+              } catch (err) {
+                lastError = err;
+                log(
+                  `session ${sessionKey}: token-count read attempt ${attempt}/3 failed (${err instanceof Error ? err.message : String(err)})`,
+                );
+                if (attempt < 3) {
+                  await new Promise((resolve) => setTimeout(resolve, 5_000));
+                }
+              }
+            }
+            if (lastError !== null) {
+              log(`session ${sessionKey}: could not read token count after 3 attempts; skipping`);
               return;
             }
           }
