@@ -12,28 +12,36 @@
  * triggers a compaction, so the next run starts small.
  *
  * Hooks used (all in the OpenClaw 2026.11.2 hook catalog):
- *   - `model_call_ended` — observe each model call's provider/model/outcome.
- *   - `before_model_resolve` — observe which model a turn is about to use.
- *   - `agent_end` — observe run success/duration; the decision point.
+ *   - `model_call_started` / `model_call_ended` — observe each model call's
+ *     provider/model/outcome. The model arrives as a BARE name in the event
+ *     (`deepseek-v4.1-flash`, `dots-studio/dots-3-note-preview:free`) with
+ *     the provider in a separate field, while the config uses full
+ *     `provider/model` ids — the plugin matches on the bare name.
+ *   - `agent_end` — the decision point.
+ *
+ * `before_model_resolve` is deliberately NOT used: its event carries only
+ * the prompt, no model, so it cannot identify which model is being
+ * resolved.
  *
  * Failure signal (learned live 2026-11-13): `agent_end.success` is NOT a
  * reliable failure signal. A run that only produced an error reply
  * ("The AI service is having trouble.") still reports success, because the
- * run completed by delivering that reply. The true signal is the tracked
- * model calls: if any call to the primary failed, or any fallback call
- * failed, the run failed — regardless of what `agent_end.success` says.
- * The plugin therefore derives run failure from its own per-run call
- * record, and only uses `agent_end.success === false` as an additional
- * trigger.
+ * run completed by delivering that reply — and a fallback call can return
+ * 200 with no usable content. The trigger is therefore what the plugin can
+ * actually observe: a fallback model started or ended a call, a primary
+ * call failed, any call failed, or the run reported failure. A fallback
+ * running on an oversized session while the primary is dead is enough to
+ * compact, whether that particular run produced a reply or not.
  *
  * Compaction itself is requested through the gateway method
  * `sessions.compact` via the local `openclaw` CLI (see gateway.ts), because
  * the public plugin SDK exposes no in-process compaction call.
  *
  * Safety:
- *   - Compaction only fires on a *failed* run that actually touched a
- *     fallback (or saw the primary fail), only when the session is over the
- *     token threshold, and at most once per session per cooldown window.
+ *   - Compaction only fires when a fallback model was observed (started or
+ *     ended a call), a primary call failed, any call failed, or the run
+ *     reported failure — and only when the session is over the token
+ *     threshold, and at most once per session per cooldown window.
  *   - Handlers never throw: a plugin error must never break an agent run.
  *   - Compaction runs through the session's configured compaction model
  *     (`agents.defaults.compaction.model`). Point that at a working model —
@@ -61,14 +69,26 @@ interface PluginConfig {
   enabledAgents?: string[];
 }
 
+interface ModelRef {
+  provider: string | null;
+  model: string;
+  /** Bare model name (no provider prefix), the comparison key. */
+  bare: string;
+}
+
 interface RunModelUsage {
   sessionKey: string;
   agentId?: string;
   primaryFailed: boolean;
+  primaryStarted: boolean;
   fallbackUsed: boolean;
+  fallbackStarted: boolean;
   fallbackFailed: boolean;
-  /** Last few calls, for the audit log line. Bounded to 8 entries. */
-  calls: Array<{ model: string | null; failed: boolean }>;
+  anyCallFailed: boolean;
+  /** Bare model names, in start order. */
+  started: string[];
+  /** Ended calls, for the audit log line. Bounded to 8 entries. */
+  ended: Array<{ model: string | null; failed: boolean }>;
 }
 
 type LogFn = (message: string) => void;
@@ -82,16 +102,25 @@ function readField(obj: unknown, ...names: string[]): unknown {
   return undefined;
 }
 
-function readModelId(event: unknown): string | null {
-  const direct = readField(event, "model", "modelId");
-  if (typeof direct === "string" && direct.trim()) return direct.trim();
-  const resolved = readField(event, "resolvedModel", "modelRef");
-  if (typeof resolved === "string" && resolved.trim()) return resolved.trim();
-  if (typeof resolved === "object" && resolved !== null) {
-    const id = readField(resolved, "id", "model");
-    if (typeof id === "string" && id.trim()) return id.trim();
-  }
-  return null;
+function bareModelId(id: string): string {
+  const slash = id.lastIndexOf("/");
+  return (slash >= 0 ? id.slice(slash + 1) : id).trim();
+}
+
+function readModelRef(event: unknown, ctx: unknown): ModelRef | null {
+  // model_call_started/ended carry `model` (bare name) + `provider` on the
+  // event, and modelId/modelProviderId on the hook context.
+  const modelRaw =
+    readField(event, "model", "modelId") ?? readField(ctx, "modelId", "model");
+  const providerRaw =
+    readField(event, "provider") ?? readField(ctx, "modelProviderId", "provider");
+  if (typeof modelRaw !== "string" || !modelRaw.trim()) return null;
+  const model = modelRaw.trim();
+  return {
+    provider: typeof providerRaw === "string" && providerRaw.trim() ? providerRaw.trim() : null,
+    model,
+    bare: bareModelId(model),
+  };
 }
 
 function readCallFailed(event: unknown): boolean {
@@ -199,10 +228,18 @@ export default definePluginEntry({
         `threshold=${tokenThreshold}, cooldownMs=${cooldownMs}, dryRun=${dryRun})`,
     );
 
-    const isFallbackModel = (modelId: string | null): boolean =>
-      modelId !== null && modelId !== primaryModel && fallbackModels.includes(modelId);
-    const isPrimaryModel = (modelId: string | null): boolean =>
-      modelId !== null && modelId === primaryModel;
+    const isFallbackModel = (ref: ModelRef | null): boolean => {
+      if (ref === null) return false;
+      if (ref.model === primaryModel) return false;
+      return fallbackModels.some(
+        (configured) =>
+          bareModelId(configured) === ref.bare || configured === ref.model,
+      );
+    };
+    const isPrimaryModel = (ref: ModelRef | null): boolean => {
+      if (ref === null) return false;
+      return ref.model === primaryModel || bareModelId(primaryModel) === ref.bare;
+    };
 
     const getRunKey = (ctx: unknown, event: unknown): string | null => {
       const runId = readField(ctx, "runId") ?? readField(event, "runId");
@@ -217,30 +254,58 @@ export default definePluginEntry({
       return typeof id === "string" && id ? id : null;
     };
 
-    const trackModelCall = (ctx: unknown, event: unknown, failed: boolean): void => {
+    const getOrCreateUsage = (
+      ctx: unknown,
+      event: unknown,
+    ): { runKey: string; usage: RunModelUsage } | null => {
+      const runKey = getRunKey(ctx, event);
+      const sessionKey = getSessionKey(ctx, event);
+      if (!runKey || !sessionKey) return null;
+      const agentId = getAgentId(ctx, event) ?? undefined;
+      if (agentId && enabledAgents.size > 0 && !enabledAgents.has(agentId)) return null;
+      let usage = runs.get(runKey);
+      if (!usage) {
+        usage = {
+          sessionKey,
+          agentId,
+          primaryFailed: false,
+          primaryStarted: false,
+          fallbackUsed: false,
+          fallbackStarted: false,
+          fallbackFailed: false,
+          anyCallFailed: false,
+          started: [],
+          ended: [],
+        };
+        runs.set(runKey, usage);
+      }
+      return { runKey, usage };
+    };
+
+    const trackModelCall = (
+      ctx: unknown,
+      event: unknown,
+      phase: "started" | "ended",
+      failed: boolean,
+    ): void => {
       try {
-        const runKey = getRunKey(ctx, event);
-        const sessionKey = getSessionKey(ctx, event);
-        if (!runKey || !sessionKey) return;
-        const agentId = getAgentId(ctx, event) ?? undefined;
-        if (agentId && enabledAgents.size > 0 && !enabledAgents.has(agentId)) return;
-        const modelId = readModelId(event);
-        let usage = runs.get(runKey);
-        if (!usage) {
-          usage = {
-            sessionKey,
-            agentId,
-            primaryFailed: false,
-            fallbackUsed: false,
-            fallbackFailed: false,
-            calls: [],
-          };
-          runs.set(runKey, usage);
+        const found = getOrCreateUsage(ctx, event);
+        if (!found) return;
+        const { usage } = found;
+        const ref = readModelRef(event, ctx);
+        if (phase === "started") {
+          if (ref) {
+            usage.started.push(ref.bare);
+            if (isPrimaryModel(ref)) usage.primaryStarted = true;
+            if (isFallbackModel(ref)) usage.fallbackStarted = true;
+          }
+          return;
         }
-        usage.calls.push({ model: modelId, failed });
-        if (usage.calls.length > 8) usage.calls.shift();
-        if (failed && isPrimaryModel(modelId)) usage.primaryFailed = true;
-        if (isFallbackModel(modelId)) {
+        usage.ended.push({ model: ref ? ref.bare : null, failed });
+        if (usage.ended.length > 8) usage.ended.shift();
+        if (failed) usage.anyCallFailed = true;
+        if (failed && isPrimaryModel(ref)) usage.primaryFailed = true;
+        if (isFallbackModel(ref)) {
           usage.fallbackUsed = true;
           if (failed) usage.fallbackFailed = true;
         }
@@ -249,14 +314,12 @@ export default definePluginEntry({
       }
     };
 
-    api.on("model_call_ended", (event, ctx) => {
-      trackModelCall(ctx, event, readCallFailed(event));
+    api.on("model_call_started", (event, ctx) => {
+      trackModelCall(ctx, event, "started", false);
     });
 
-    api.on("before_model_resolve", (event, ctx) => {
-      // Records which model a turn is about to use; a fallback showing up
-      // here is evidence even if its model call never completes.
-      trackModelCall(ctx, event, false);
+    api.on("model_call_ended", (event, ctx) => {
+      trackModelCall(ctx, event, "ended", readCallFailed(event));
     });
 
     api.on("agent_end", (event, ctx) => {
@@ -278,16 +341,34 @@ export default definePluginEntry({
           if (!usage) return;
 
           // agent_end.success is true even when the run only produced an
-          // error reply, so derive failure from the tracked model calls.
-          const runFailed =
-            readRunFailed(event) || usage.primaryFailed || usage.fallbackFailed;
-          const callsSummary = usage.calls
+          // error reply, so the trigger comes from the tracked model calls.
+          const failoverObserved =
+            (usage.primaryStarted || usage.primaryFailed) &&
+            (usage.fallbackStarted || usage.fallbackUsed);
+          const trigger =
+            usage.fallbackStarted ||
+            usage.fallbackUsed ||
+            usage.primaryFailed ||
+            usage.anyCallFailed ||
+            readRunFailed(event);
+          const triggerDetail = failoverObserved
+            ? "failover observed: primary attempted, then a fallback ran"
+            : usage.fallbackUsed || usage.fallbackStarted
+              ? "a fallback model ran"
+              : usage.primaryFailed
+                ? "a primary model call failed"
+                : usage.anyCallFailed
+                  ? "a model call failed"
+                  : "the run reported failure";
+          const startedSummary = usage.started.join(",");
+          const endedSummary = usage.ended
             .map((c) => `${c.model ?? "?"}:${c.failed ? "fail" : "ok"}`)
             .join(",");
           log(
             `session ${sessionKey} run ${runKey}: agent_end success=${String(readField(event, "success"))} ` +
-              `primaryFailed=${usage.primaryFailed} fallbackUsed=${usage.fallbackUsed} ` +
-              `fallbackFailed=${usage.fallbackFailed} calls=[${callsSummary}]`,
+              `primaryStarted=${usage.primaryStarted} primaryFailed=${usage.primaryFailed} ` +
+              `fallbackStarted=${usage.fallbackStarted} fallbackUsed=${usage.fallbackUsed} ` +
+              `fallbackFailed=${usage.fallbackFailed} started=[${startedSummary}] ended=[${endedSummary}]`,
           );
           const now = Date.now();
           const cached = sizeCache.get(sessionKey);
@@ -310,9 +391,8 @@ export default definePluginEntry({
           }
 
           const decision = shouldCompact({
-            runFailed,
-            primaryFailed: usage.primaryFailed,
-            fallbackUsed: usage.fallbackUsed,
+            trigger,
+            triggerDetail,
             inputTokens,
             tokenThreshold,
             lastCompactAt: lastCompactAt.get(sessionKey) ?? null,

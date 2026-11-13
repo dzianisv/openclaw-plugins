@@ -3,9 +3,8 @@ import assert from "node:assert/strict";
 import { shouldCompact } from "../dist/decision.js";
 
 const base = {
-  runFailed: true,
-  primaryFailed: true,
-  fallbackUsed: true,
+  trigger: true,
+  triggerDetail: "fallback model ran after the primary failed",
   inputTokens: 230_000,
   tokenThreshold: 100_000,
   lastCompactAt: null,
@@ -14,24 +13,14 @@ const base = {
 };
 
 describe("shouldCompact", () => {
-  it("compacts a failed fallback run over threshold", () => {
+  it("compacts a triggered run over threshold", () => {
     const d = shouldCompact({ ...base });
     assert.equal(d.compact, true);
   });
 
-  it("skips a successful run even when a fallback was used", () => {
-    const d = shouldCompact({ ...base, runFailed: false });
+  it("skips a run with no trigger, even over threshold", () => {
+    const d = shouldCompact({ ...base, trigger: false });
     assert.equal(d.compact, false);
-  });
-
-  it("skips when neither the primary failed nor a fallback ran", () => {
-    const d = shouldCompact({ ...base, primaryFailed: false, fallbackUsed: false });
-    assert.equal(d.compact, false);
-  });
-
-  it("compacts when only the primary failed (fallback never got a call)", () => {
-    const d = shouldCompact({ ...base, fallbackUsed: false });
-    assert.equal(d.compact, true);
   });
 
   it("skips a small session", () => {

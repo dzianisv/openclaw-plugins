@@ -38,11 +38,12 @@ The plugin observes three hooks from the OpenClaw 2026.11.2 hook catalog:
 
 A compaction fires only when **all** of these hold:
 
-1. The run just ended in failure.
-2. The primary model failed during the run, or a fallback model was used.
-3. The session's input tokens (read from `sessions.list`) exceed
+1. A trigger fired for the run: a fallback model started or ended a call,
+   a primary call failed, any call failed, or the run reported failure at
+   `agent_end`.
+2. The session's input tokens (read from `sessions.list`) exceed
    `tokenThreshold` (default 100,000).
-4. The per-session cooldown has elapsed (default 1 hour).
+3. The per-session cooldown has elapsed (default 1 hour).
 
 Compaction is requested through the gateway method `sessions.compact`, called
 via the local `openclaw` CLI — the same call an operator would make by hand.
@@ -58,12 +59,17 @@ compaction 429s like everything else. See "Configuration" below.
 
 Handlers never throw: a plugin error must never break an agent run.
 
-**Failure signal:** the plugin derives run failure from the model calls it
-observed (`model_call_ended`), not from `agent_end.success`. A run that only
-produces an error reply still reports `success` at `agent_end`, because the
-run completed by delivering that reply — so `agent_end.success` alone would
-miss every failure this plugin exists for. If any call to the primary failed,
-or any fallback call failed, the run counts as failed.
+**Failure signal:** the plugin derives its trigger from the model calls it
+observed (`model_call_started` / `model_call_ended`), not from
+`agent_end.success`. A run that only produces an error reply still reports
+`success` at `agent_end`, because the run completed by delivering that reply
+— and a fallback call can return 200 with no usable content. A fallback
+running on an oversized session while the primary is dead is enough to
+compact, whether that particular run produced a reply or not. Model ids are
+matched on the bare name: hook events carry `deepseek-v4.1-flash` and
+`dots-studio/dots-3-note-preview:free` while the config uses full
+`provider/model` ids. `before_model_resolve` is not used — its event
+carries only the prompt, no model.
 
 ## Install
 
