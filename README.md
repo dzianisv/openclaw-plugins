@@ -58,6 +58,13 @@ compaction 429s like everything else. See "Configuration" below.
 
 Handlers never throw: a plugin error must never break an agent run.
 
+**Failure signal:** the plugin derives run failure from the model calls it
+observed (`model_call_ended`), not from `agent_end.success`. A run that only
+produces an error reply still reports `success` at `agent_end`, because the
+run completed by delivering that reply — so `agent_end.success` alone would
+miss every failure this plugin exists for. If any call to the primary failed,
+or any fallback call failed, the run counts as failed.
+
 ## Install
 
 Published plugins ship built JavaScript; a git checkout needs one build

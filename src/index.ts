@@ -16,6 +16,16 @@
  *   - `before_model_resolve` — observe which model a turn is about to use.
  *   - `agent_end` — observe run success/duration; the decision point.
  *
+ * Failure signal (learned live 2026-11-13): `agent_end.success` is NOT a
+ * reliable failure signal. A run that only produced an error reply
+ * ("The AI service is having trouble.") still reports success, because the
+ * run completed by delivering that reply. The true signal is the tracked
+ * model calls: if any call to the primary failed, or any fallback call
+ * failed, the run failed — regardless of what `agent_end.success` says.
+ * The plugin therefore derives run failure from its own per-run call
+ * record, and only uses `agent_end.success === false` as an additional
+ * trigger.
+ *
  * Compaction itself is requested through the gateway method
  * `sessions.compact` via the local `openclaw` CLI (see gateway.ts), because
  * the public plugin SDK exposes no in-process compaction call.
@@ -56,6 +66,9 @@ interface RunModelUsage {
   agentId?: string;
   primaryFailed: boolean;
   fallbackUsed: boolean;
+  fallbackFailed: boolean;
+  /** Last few calls, for the audit log line. Bounded to 8 entries. */
+  calls: Array<{ model: string | null; failed: boolean }>;
 }
 
 type LogFn = (message: string) => void;
@@ -214,11 +227,23 @@ export default definePluginEntry({
         const modelId = readModelId(event);
         let usage = runs.get(runKey);
         if (!usage) {
-          usage = { sessionKey, agentId, primaryFailed: false, fallbackUsed: false };
+          usage = {
+            sessionKey,
+            agentId,
+            primaryFailed: false,
+            fallbackUsed: false,
+            fallbackFailed: false,
+            calls: [],
+          };
           runs.set(runKey, usage);
         }
+        usage.calls.push({ model: modelId, failed });
+        if (usage.calls.length > 8) usage.calls.shift();
         if (failed && isPrimaryModel(modelId)) usage.primaryFailed = true;
-        if (isFallbackModel(modelId)) usage.fallbackUsed = true;
+        if (isFallbackModel(modelId)) {
+          usage.fallbackUsed = true;
+          if (failed) usage.fallbackFailed = true;
+        }
       } catch {
         // Observation must never break a run.
       }
@@ -252,7 +277,18 @@ export default definePluginEntry({
           if (agentId && enabledAgents.size > 0 && !enabledAgents.has(agentId)) return;
           if (!usage) return;
 
-          const runFailed = readRunFailed(event);
+          // agent_end.success is true even when the run only produced an
+          // error reply, so derive failure from the tracked model calls.
+          const runFailed =
+            readRunFailed(event) || usage.primaryFailed || usage.fallbackFailed;
+          const callsSummary = usage.calls
+            .map((c) => `${c.model ?? "?"}:${c.failed ? "fail" : "ok"}`)
+            .join(",");
+          log(
+            `session ${sessionKey} run ${runKey}: agent_end success=${String(readField(event, "success"))} ` +
+              `primaryFailed=${usage.primaryFailed} fallbackUsed=${usage.fallbackUsed} ` +
+              `fallbackFailed=${usage.fallbackFailed} calls=[${callsSummary}]`,
+          );
           const now = Date.now();
           const cached = sizeCache.get(sessionKey);
           let inputTokens: number | null;
