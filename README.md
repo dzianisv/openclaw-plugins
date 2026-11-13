@@ -71,11 +71,13 @@ npm install
 npm run build            # produces dist/index.js
 ```
 
-Stop the gateway, link-install the plugin, start the gateway again:
+Stop the gateway, link-install the plugin, start the gateway again.
+The install needs `--accept-capabilities` (the plugin reads conversation
+hooks) and `--force` (it is not from ClawHub):
 
 ```bash
 systemctl --user stop openclaw-gateway
-openclaw plugins install --link ./openclaw-failover-compact --force
+openclaw plugins install --link ./openclaw-failover-compact --force --accept-capabilities
 openclaw plugins enable failover-compact
 systemctl --user start openclaw-gateway
 ```
