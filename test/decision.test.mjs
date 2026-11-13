@@ -1,0 +1,56 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { shouldCompact } from "../dist/decision.js";
+
+const base = {
+  runFailed: true,
+  primaryFailed: true,
+  fallbackUsed: true,
+  inputTokens: 230_000,
+  tokenThreshold: 100_000,
+  lastCompactAt: null,
+  cooldownMs: 3_600_000,
+  now: 1_800_000_000_000,
+};
+
+describe("shouldCompact", () => {
+  it("compacts a failed fallback run over threshold", () => {
+    const d = shouldCompact({ ...base });
+    assert.equal(d.compact, true);
+  });
+
+  it("skips a successful run even when a fallback was used", () => {
+    const d = shouldCompact({ ...base, runFailed: false });
+    assert.equal(d.compact, false);
+  });
+
+  it("skips when neither the primary failed nor a fallback ran", () => {
+    const d = shouldCompact({ ...base, primaryFailed: false, fallbackUsed: false });
+    assert.equal(d.compact, false);
+  });
+
+  it("compacts when only the primary failed (fallback never got a call)", () => {
+    const d = shouldCompact({ ...base, fallbackUsed: false });
+    assert.equal(d.compact, true);
+  });
+
+  it("skips a small session", () => {
+    const d = shouldCompact({ ...base, inputTokens: 50_000 });
+    assert.equal(d.compact, false);
+  });
+
+  it("refuses to guess when the token count is unknown", () => {
+    const d = shouldCompact({ ...base, inputTokens: null });
+    assert.equal(d.compact, false);
+  });
+
+  it("respects the cooldown", () => {
+    const d = shouldCompact({ ...base, lastCompactAt: base.now - 60_000 });
+    assert.equal(d.compact, false);
+  });
+
+  it("compacts again after the cooldown elapses", () => {
+    const d = shouldCompact({ ...base, lastCompactAt: base.now - 3_600_001 });
+    assert.equal(d.compact, true);
+  });
+});
