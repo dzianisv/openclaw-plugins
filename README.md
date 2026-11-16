@@ -21,7 +21,7 @@ openclaw plugins list   # goal and goal-tool should both be loaded
 
 No gateway restart needed for the first install (`plugins install --link` loads live). Config lives in `plugins.entries.goal` / `plugins.entries.goal-tool` in `openclaw.json` (see each `openclaw.plugin.json` for the schema). The Judge model defaults to `openai/gpt-6.1-sol`.
 
-**Reloading:** do NOT use `openclaw plugins reload goal` (or `goal-tool`) to load new code. The plugin's background work (Judge ~60s, push minutes) keeps it "busy", and the plugin host only waits 5s to drain — the reload fails with "Previous plugin cleanup failed" and can leave the plugin retired. Load new code with a **gateway restart** instead.
+**Reloading:** do NOT use `openclaw plugins reload goal` (or `goal-tool`) to load new code. The plugin's background work (Judge ~60s, push minutes) keeps it "busy", and the plugin host only waits 5s to drain — the reload fails with "Previous plugin cleanup failed" and can leave the plugin retired. Load new code with a **gateway restart** instead. Restart AFTER the copy lands: a gateway that starts before the new `dist/` is in place loads the old code while `package.json` already shows the new version — check the loaded code (a live `goal(action="list")` call), not just the version number.
 
 ## The `goal` tool
 
@@ -57,7 +57,9 @@ cd goal-plugin && npm test   # builds, then node --test test/*.test.mjs
 
 ## Status
 
-Built, loaded, and mostly verified live on OpenClaw 2026.11.2 (see `goal-plugin/BUILD-REPORT.md`). Two things were not yet verified live at 0.1.0: the `goal` tool callable by an agent in a live turn, and a successful push. Note: OpenClaw 2026.11.2 already has built-in goal tools (`get_goal`, `create_goal`, `update_goal`) — if the custom `goal` tool still does not appear after a restart, pivot the tool surface to the built-ins and have the Judge read OpenClaw's session-goal store.
+Built, loaded, and verified live on OpenClaw 2026.11.2 (see `goal-plugin/BUILD-REPORT.md`). 0.2.0 verified live 2026-11-16: `goal(get)` + `goal(list)` return the agent's goal; create-with-replace is refused for user-set goals; complete with weak evidence does not complete the goal; a push continuation turn was observed (Monica's turns_used 2→3 after her get turn). Note: OpenClaw 2026.11.2 already has built-in goal tools (`get_goal`, `create_goal`, `update_goal`) — if the custom `goal` tool still does not appear after a restart, pivot the tool surface to the built-ins and have the Judge read OpenClaw's session-goal store.
+
+**Supervisor cron gotcha (verified 2026-11-16):** an `agentTurn` cron job with delivery mode `none` FAILS — the session-event lane dies in ~4s with "plugin delivery capability is no longer active" (and falls back to the free model first). Delivery must stay `announce`; keep the job quiet via its prompt ("end quietly, do not post a status update") and point the destination at a team channel, not the user's DM.
 
 ## License
 
