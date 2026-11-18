@@ -3,12 +3,9 @@
  *
  * Route: `openclaw capability model run --agent <agentId> --model <judgeModel>
  * --prompt <prompt> --json`. A one-shot model turn, not a full agent turn.
- * The judge model is configurable; default is the agent's primary model
- * (openai/gpt-6.1-sol) because the free cheap model (opencode-go
- * deepseek-v4.1-flash) is monthly-limit-exhausted until ~Dec 3, 2026, and
- * the OpenRouter fallback 429s. The judge call is short (small prompt),
- * so it is cheap in tokens even on the primary. Switch judgeModel to
- * deepseek when its monthly limit resets.
+ * The judge model is configurable; default is the free OpenRouter model
+ * (openrouter/nvidia/nemotron-3.5-super-vl:free). The judge call is short
+ * (small prompt), so it is cheap in tokens even on the primary.
  *
  * Transport errors (CLI failure, 429, timeout) set transportFailed and
  * fail-open to "continue" — but the caller counts consecutive failures and

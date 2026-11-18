@@ -22,7 +22,7 @@ openclaw plugins install --link /path/to/failover-compact
 openclaw plugins list   # goal, goal-tool, failover-compact should all be loaded
 ```
 
-No gateway restart needed for the first install (`plugins install --link` loads live). Config lives in `plugins.entries.<name>` in `openclaw.json` (see each `openclaw.plugin.json` for the schema). The Judge model defaults to `openai/gpt-6.1-sol`.
+No gateway restart needed for the first install (`plugins install --link` loads live). Config lives in `plugins.entries.<name>` in `openclaw.json` (see each `openclaw.plugin.json` for the schema). The Judge model defaults to `openrouter/nvidia/nemotron-3.5-super-vl:free`.
 
 **Reloading:** do NOT use `openclaw plugins reload <name>` to load new code. A plugin's background work (Judge ~60s, push minutes) keeps it "busy", and the plugin host only waits 5s to drain — the reload fails with "Previous plugin cleanup failed" and can leave the plugin retired. Load new code with a **gateway restart** instead. Restart AFTER the copy lands: a gateway that starts before the new `dist/` is in place loads the old code while `package.json` already shows the new version — check the loaded code (a live `goal(action="list")` call), not just the version number.
 

@@ -54,7 +54,7 @@ export interface GoalConfig {
 }
 
 export const DEFAULT_CONFIG: GoalConfig = {
-  judgeModel: "openai/gpt-6.1-sol",
+  judgeModel: "openrouter/nvidia/nemotron-3.5-super-vl:free",
   // The Judge is a model call on a loaded VM (~60-70s). The agent_end hook
   // is fire-and-forget, so the Judge may run longer than the ~30s hook
   // budget — the budget bounds the await, not the background work.

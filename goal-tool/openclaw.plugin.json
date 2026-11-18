@@ -32,7 +32,7 @@
         "type": "array"
       },
       "judgeModel": {
-        "description": "Model for the Judge (one-shot call). Default openai/gpt-6.1-sol. The free deepseek model is monthly-limit-exhausted until ~Dec 3, 2026.",
+        "description": "Model for the Judge (one-shot call). Default openrouter/nvidia/nemotron-3.5-super-vl:free (free OpenRouter tier).",
         "type": "string"
       },
       "judgeTimeoutMs": {

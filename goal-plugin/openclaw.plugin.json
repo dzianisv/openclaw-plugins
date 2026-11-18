@@ -1,1 +1,64 @@
-{"activation":{"onStartup":true},"categories":["developer-tools"],"configSchema":{"additionalProperties":false,"properties":{"cliPath":{"description":"Path to the openclaw binary used for the Judge call and the push. Default 'openclaw' (resolved from PATH).","type":"string"},"dbPath":{"description":"SQLite registry path. Default <openclaw state dir>/goal.db.","type":"string"},"defaultMaxTurns":{"description":"Default turn budget for a new goal. Default 20.","type":"number"},"dryRun":{"description":"When true, log what would be pushed but do not push. Default false.","type":"boolean"},"enabledAgents":{"description":"Optional allowlist of agent ids this plugin acts on. When empty, all agents are covered.","items":{"type":"string"},"type":"array"},"judgeModel":{"description":"Model for the Judge (one-shot call). Default openai/gpt-6.1-sol. The free deepseek model is monthly-limit-exhausted until ~Dec 3, 2026.","type":"string"},"judgeTimeoutMs":{"description":"Judge call timeout in ms. Default 120000. The Judge is a model call on a loaded VM (~60-70s); the agent_end hook is fire-and-forget, so the Judge may run longer than the ~30s hook budget.","type":"number"},"maxJudgeOutages":{"description":"Consecutive judge outages before the goal pauses. Default 3.","type":"number"},"maxParseFailures":{"description":"Consecutive unparseable judge outputs before the goal pauses. Default 3.","type":"number"},"maxStalledTurns":{"description":"Consecutive no-progress turns before the goal pauses. Default 5.","type":"number"},"pushTimeoutSeconds":{"description":"Timeout in seconds for the push agentTurn. Default 300.","type":"number"}},"type":"object"},"description":"Per-session goal ownership: the agent declares its goal, a judge audits it at every turn-end, and an unreached goal pushes a continuation prompt into the idle session.","id":"goal","name":"Goal"}
+{
+  "activation": {
+    "onStartup": true
+  },
+  "categories": [
+    "developer-tools"
+  ],
+  "configSchema": {
+    "additionalProperties": false,
+    "properties": {
+      "cliPath": {
+        "description": "Path to the openclaw binary used for the Judge call and the push. Default 'openclaw' (resolved from PATH).",
+        "type": "string"
+      },
+      "dbPath": {
+        "description": "SQLite registry path. Default <openclaw state dir>/goal.db.",
+        "type": "string"
+      },
+      "defaultMaxTurns": {
+        "description": "Default turn budget for a new goal. Default 20.",
+        "type": "number"
+      },
+      "dryRun": {
+        "description": "When true, log what would be pushed but do not push. Default false.",
+        "type": "boolean"
+      },
+      "enabledAgents": {
+        "description": "Optional allowlist of agent ids this plugin acts on. When empty, all agents are covered.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "judgeModel": {
+        "description": "Model for the Judge (one-shot call). Default openrouter/nvidia/nemotron-3.5-super-vl:free (free OpenRouter tier).",
+        "type": "string"
+      },
+      "judgeTimeoutMs": {
+        "description": "Judge call timeout in ms. Default 120000. The Judge is a model call on a loaded VM (~60-70s); the agent_end hook is fire-and-forget, so the Judge may run longer than the ~30s hook budget.",
+        "type": "number"
+      },
+      "maxJudgeOutages": {
+        "description": "Consecutive judge outages before the goal pauses. Default 3.",
+        "type": "number"
+      },
+      "maxParseFailures": {
+        "description": "Consecutive unparseable judge outputs before the goal pauses. Default 3.",
+        "type": "number"
+      },
+      "maxStalledTurns": {
+        "description": "Consecutive no-progress turns before the goal pauses. Default 5.",
+        "type": "number"
+      },
+      "pushTimeoutSeconds": {
+        "description": "Timeout in seconds for the push agentTurn. Default 300.",
+        "type": "number"
+      }
+    },
+    "type": "object"
+  },
+  "description": "Per-session goal ownership: the agent declares its goal, a judge audits it at every turn-end, and an unreached goal pushes a continuation prompt into the idle session.",
+  "id": "goal",
+  "name": "Goal"
+}
