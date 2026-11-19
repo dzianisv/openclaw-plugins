@@ -26,11 +26,17 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getGoal, openRegistry, saveGoal } from "./registry.js";
+import { getGoal, listGoals, openRegistry, saveGoal, type GoalRow } from "./registry.js";
 import { evaluateTurnEnd, setUserGoal, DEFAULT_CONFIG, type GoalConfig } from "./goal.js";
 import { PerSessionQueue } from "./turn-end-queue.js";
+import {
+  allLinkedTerminal,
+  buildNudgePrompt,
+  checkLinkedWork,
+  detectBlockerClaim,
+} from "./nudge.js";
 import { type JudgeOptions } from "./judge.js";
-import type { PushOptions } from "./push.js";
+import { pushContinuation, type PushOptions } from "./push.js";
 
 interface PluginConfig {
   judgeModel?: string;
@@ -42,6 +48,9 @@ interface PluginConfig {
   enabledAgents?: string[];
   cliPath?: string;
   pushTimeoutSeconds?: number;
+  nudgeEnabled?: boolean;
+  nudgeIntervalMinutes?: number;
+  nudgeInitialDelaySeconds?: number;
   dbPath?: string;
   dryRun?: boolean;
 }
@@ -117,6 +126,9 @@ export default definePluginEntry({
       cliPath: typeof pc.cliPath === "string" && pc.cliPath.trim() ? pc.cliPath.trim() : DEFAULT_CONFIG.cliPath,
       pushTimeoutSeconds: typeof pc.pushTimeoutSeconds === "number" && pc.pushTimeoutSeconds > 0 ? pc.pushTimeoutSeconds : DEFAULT_CONFIG.pushTimeoutSeconds,
       dryRun: pc.dryRun === true,
+      nudgeEnabled: pc.nudgeEnabled !== false,
+      nudgeIntervalMinutes: typeof pc.nudgeIntervalMinutes === "number" && pc.nudgeIntervalMinutes > 0 ? pc.nudgeIntervalMinutes : DEFAULT_CONFIG.nudgeIntervalMinutes,
+      nudgeInitialDelaySeconds: typeof pc.nudgeInitialDelaySeconds === "number" && pc.nudgeInitialDelaySeconds >= 0 ? pc.nudgeInitialDelaySeconds : DEFAULT_CONFIG.nudgeInitialDelaySeconds,
     };
     const enabledAgents = new Set(
       (Array.isArray(pc.enabledAgents) ? pc.enabledAgents : []).filter((a): a is string => typeof a === "string" && !!a.trim()),
@@ -140,6 +152,136 @@ export default definePluginEntry({
     // tools declared via defineToolPlugin (the metadata attached to the
     // entry). The `goal` tool lives in the sibling `goal-tool` plugin
     // (defineToolPlugin). This plugin only runs the turn-end hook.
+
+    // ---- periodic driver + worker-end resume ----
+    // The turn-end judge only fires when the goal's own session ends a
+    // turn. A goal parked in waiting/subagents — or an idle session —
+    // never produces that event, so the loop stalls silently (the
+    // 2026-11-18 freeze: a goal sat waiting/subagents for a day while
+    // its workers finished). This driver is the plugin-level push:
+    // every nudgeIntervalMinutes it scans ALL goals in the registry
+    // (any agent, any session) and pushes each non-complete goal's
+    // owning session with the current state. If a goal is parked on
+    // subagents and every linked item is terminal, the driver first
+    // resumes it (same state transition as the plugin's resume action),
+    // then pushes. Paused goals are left alone — a human paused them.
+    const driverPushOpts: PushOptions = { cliPath: cfg.cliPath, timeoutSeconds: cfg.pushTimeoutSeconds };
+    // This gateway registers the plugin more than once in the same
+    // process, so the driver's guards live on globalThis — shared across
+    // registrations. Without this, each registration would run its own
+    // scan and push the same goal once per registration.
+    const driverLocks = ((globalThis as unknown as {
+      __goalDriverLocks?: { inFlight: Set<string>; scanning: boolean };
+    }).__goalDriverLocks ??= { inFlight: new Set<string>(), scanning: false });
+    const nudgeInFlight = driverLocks.inFlight;
+
+    const resumeGoal = (goal: GoalRow): GoalRow => {
+      const resumed: GoalRow = {
+        ...goal,
+        status: "active",
+        waitingOn: "",
+        waitingReason: "",
+        waitingUntil: 0,
+        lastReason: "Resumed by the goal driver: the waited-on linked work is terminal.",
+        updatedAt: Date.now(),
+      };
+      saveGoal(getDb(), resumed);
+      return resumed;
+    };
+
+    const nudgeGoal = async (goal: GoalRow, mode: "periodic" | "worker-ended"): Promise<void> => {
+      if (nudgeInFlight.has(goal.sessionKey)) return;
+      nudgeInFlight.add(goal.sessionKey);
+      try {
+        const linked = await checkLinkedWork(goal.linkedTaskIds, 30_000);
+        const parkedOnSubagents = goal.status === "waiting" && goal.waitingOn === "subagents";
+        const terminal = allLinkedTerminal(linked);
+        if (mode === "worker-ended" && !terminal) return;
+        let current = goal;
+        let resumed = false;
+        if (parkedOnSubagents && terminal) {
+          current = resumeGoal(goal);
+          resumed = true;
+        }
+        if (cfg.dryRun) {
+          log(`driver: [dry-run] would nudge ${goal.sessionKey} (mode=${mode}, status=${current.status}, resumed=${resumed})`);
+          return;
+        }
+        const prompt = buildNudgePrompt(current, linked, {
+          wake: resumed ? "resumed" : mode === "worker-ended" ? "linked-work-terminal" : "periodic",
+          rejectedClaim: detectBlockerClaim(current.lastResponseSnippet) || undefined,
+        });
+        const result = await pushContinuation(current.agentId, current.sessionKey, prompt, driverPushOpts);
+        if (result.ok) {
+          log(`driver: nudged ${goal.sessionKey} (mode=${mode}, status=${current.status}, turns=${current.turnsUsed}/${current.maxTurns})`);
+        } else {
+          log(`driver: nudge push FAILED for ${goal.sessionKey}: ${result.detail}`);
+        }
+      } catch (err) {
+        log(`driver: nudge error for ${goal.sessionKey}: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        nudgeInFlight.delete(goal.sessionKey);
+      }
+    };
+
+    const scanAllGoals = async (trigger: string): Promise<void> => {
+      if (driverLocks.scanning) return;
+      driverLocks.scanning = true;
+      try {
+        const goals = listGoals(getDb());
+        for (const goal of goals) {
+          if (goal.status === "done" || goal.status === "cancelled") continue;
+          if (enabledAgents.size > 0 && !enabledAgents.has(goal.agentId)) continue;
+          if (goal.sessionKey.startsWith("cron_")) continue;
+          if (goal.status === "paused") {
+            log(`driver: skipping paused goal in ${goal.sessionKey} (${trigger}) — pause cause: ${(goal.lastReason || "unknown").slice(0, 160)}`);
+            continue;
+          }
+          await nudgeGoal(goal, "periodic");
+        }
+      } catch {
+        // The driver must never break the gateway.
+      } finally {
+        driverLocks.scanning = false;
+      }
+    };
+
+    // Called from the turn-end hook: a run just ended in
+    // `workerSessionKey`. If that run belongs to an agent whose goal is
+    // parked on subagents, give the driver a chance to resume + push the
+    // goal's own main session (it acts only when the linked work is
+    // terminal).
+    const maybeResumeOnWorkerEnd = async (workerSessionKey: string, workerAgentId: string): Promise<void> => {
+      try {
+        if (!cfg.nudgeEnabled || !workerAgentId) return;
+        const siblings = listGoals(getDb()).filter(
+          (g) =>
+            g.agentId === workerAgentId &&
+            g.sessionKey !== workerSessionKey &&
+            g.status === "waiting" &&
+            g.waitingOn === "subagents",
+        );
+        for (const goal of siblings) {
+          await nudgeGoal(goal, "worker-ended");
+        }
+      } catch {
+        // Observation must never break a run.
+      }
+    };
+
+    if (cfg.nudgeEnabled) {
+      const intervalMs = Math.max(1, cfg.nudgeIntervalMinutes) * 60_000;
+      const initialDelayMs = Math.max(0, cfg.nudgeInitialDelaySeconds) * 1000;
+      const driverTimer = setInterval(() => {
+        void scanAllGoals("periodic");
+      }, intervalMs);
+      (driverTimer as unknown as { unref?: () => void }).unref?.();
+      const initialTimer = setTimeout(() => {
+        void scanAllGoals("initial");
+      }, initialDelayMs);
+      (initialTimer as unknown as { unref?: () => void }).unref?.();
+      log(`driver: nudge enabled (every ${cfg.nudgeIntervalMinutes} min, first scan in ${cfg.nudgeInitialDelaySeconds}s)`);
+    }
 
     // ---- turn-end: Judge the goal, push if not reached (the reactive wake) ----
     // W16: evaluations are serialized per session. agent_end can fire
@@ -179,6 +321,11 @@ export default definePluginEntry({
           if (enabledAgents.size > 0 && agentId && !enabledAgents.has(agentId)) return;
           // Re-read here (not at hook-fire time): an earlier queued
           // evaluation may have paused or parked the goal meanwhile.
+          // Worker-end wake first: if this run was a worker/subagent
+          // of an agent whose goal is parked on subagents and the
+          // linked work just went terminal, the driver resumes the
+          // goal and pushes its own main session.
+          await maybeResumeOnWorkerEnd(sessionKey, agentId);
           const goal = getGoal(getDb(), sessionKey);
           if (!goal || goal.status !== "active") return;
           const lastResponse = extractLastAssistantText(readField(event, "messages"));

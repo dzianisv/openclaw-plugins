@@ -52,6 +52,9 @@ export interface GoalConfig {
   defaultMaxTurns: number;
   cliPath: string;
   pushTimeoutSeconds: number;
+  nudgeEnabled: boolean;
+  nudgeIntervalMinutes: number;
+  nudgeInitialDelaySeconds: number;
   dryRun: boolean;
 }
 
@@ -67,6 +70,9 @@ export const DEFAULT_CONFIG: GoalConfig = {
   defaultMaxTurns: 20,
   cliPath: "openclaw",
   pushTimeoutSeconds: 300,
+  nudgeEnabled: true,
+  nudgeIntervalMinutes: 30,
+  nudgeInitialDelaySeconds: 120,
   dryRun: false,
 };
 

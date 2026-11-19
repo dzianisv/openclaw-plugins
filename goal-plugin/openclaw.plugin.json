@@ -54,6 +54,20 @@
       "pushTimeoutSeconds": {
         "description": "Timeout in seconds for the push agentTurn. Default 300.",
         "type": "number"
+      },
+      "nudgeEnabled": {
+        "description": "Enable the periodic goal driver that nudges every non-complete goal's owning session. Default true.",
+        "type": "boolean"
+      },
+      "nudgeIntervalMinutes": {
+        "description": "Minutes between driver scans of the goal registry. Default 30.",
+        "type": "number",
+        "minimum": 1
+      },
+      "nudgeInitialDelaySeconds": {
+        "description": "Delay before the first driver scan after the gateway starts. Default 120.",
+        "type": "number",
+        "minimum": 0
       }
     },
     "type": "object"
