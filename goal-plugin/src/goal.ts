@@ -25,7 +25,9 @@
  * continuation prompt into the idle session. The push IS the wake.
  *
  * Order (mirrors Hermes evaluate_after_turn, with the agent-goal fix):
- *   judge -> wait/blocked/done -> parse-failure limit -> stall check ->
+ *   judge -> re-gate on the fresh registry row (W16: a pause written
+ *   while the judge ran is authoritative — no push, no turn charged) ->
+ *   wait/blocked/done -> parse-failure limit -> stall check ->
  *   turn budget -> push.
  */
 import type { DatabaseSync } from "node:sqlite";
@@ -562,7 +564,7 @@ export async function evaluateTurnEnd(
   }> = (input) => judgeGoal(input, judgeOpts),
 ): Promise<TurnEndDecision> {
   if (isCronSession(sessionKey)) return { action: "skipped", reason: "cron session" };
-  const g = getGoal(db, sessionKey);
+  let g = getGoal(db, sessionKey);
   if (!g) return { action: "skipped", reason: "no goal for this session" };
   if (g.status === "done" || g.status === "cancelled") return { action: "skipped", reason: `goal ${g.status}` };
   if (g.status === "paused") return { action: "skipped", reason: "goal paused" };
@@ -592,6 +594,25 @@ export async function evaluateTurnEnd(
       subgoals: g.subgoals,
     },
   );
+
+  // W16 re-gate: the judge call takes ~60s, and the goal may have changed
+  // while it ran — another evaluation may have paused or parked it, or
+  // the agent may have updated it. Re-read the registry and continue
+  // only if this goal is still active at this revision. A pause written
+  // mid-judge is authoritative: return without writing the stale copy
+  // back (saveGoal is a full-row upsert — a stale save would write
+  // `active` over the pause), without charging a turn, and without
+  // pushing. Everything below this point is synchronous until the push,
+  // so no second re-gate is needed before it.
+  const fresh = getGoal(db, sessionKey);
+  if (!fresh || fresh.status !== "active" || fresh.revision !== g.revision) {
+    return {
+      action: "skipped",
+      reason: `goal ${fresh?.status ?? "deleted"} while judging — no push, no turn charged`,
+      verdict: judge.verdict,
+    };
+  }
+  g = fresh;
 
   if (judge.transportFailed) {
     // The judge being unreachable says nothing about the goal — but unlike

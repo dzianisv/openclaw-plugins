@@ -28,6 +28,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getGoal, openRegistry, saveGoal } from "./registry.js";
 import { evaluateTurnEnd, setUserGoal, DEFAULT_CONFIG, type GoalConfig } from "./goal.js";
+import { PerSessionQueue } from "./turn-end-queue.js";
 import { type JudgeOptions } from "./judge.js";
 import type { PushOptions } from "./push.js";
 
@@ -141,31 +142,43 @@ export default definePluginEntry({
     // (defineToolPlugin). This plugin only runs the turn-end hook.
 
     // ---- turn-end: Judge the goal, push if not reached (the reactive wake) ----
+    // W16: evaluations are serialized per session. agent_end can fire
+    // several times a minute for one session, and each evaluation runs a
+    // ~60s judge call; without this they overlap and a pause written by
+    // one does not stop the others from pushing (and charging turns).
+    // Different sessions still evaluate in parallel.
     const seenRuns = new Set<string>();
+    const turnEndQueue = new PerSessionQueue();
     api.on("agent_end", (event, ctx) => {
+      // Synchronous dedup + session-key read: two identical runIds firing
+      // back-to-back must not both enter the queue.
+      const runId = readField(ctx, "runId") ?? readField(event, "runId");
+      const runKey = typeof runId === "string" && runId ? runId : "";
+      if (runKey) {
+        if (seenRuns.has(runKey)) return;
+        seenRuns.add(runKey);
+        if (seenRuns.size > 500) {
+          const oldest = seenRuns.values().next().value;
+          if (oldest) seenRuns.delete(oldest);
+        }
+      }
+      const sessionKey =
+        (readField(ctx, "sessionKey") as string | undefined) ??
+        (readField(event, "sessionKey") as string | undefined) ??
+        "";
+      if (!sessionKey || sessionKey.startsWith("cron_")) return;
       // Fire-and-forget: the hook budget bounds the await, not the work.
-      void (async () => {
+      // The queue runs the evaluation in the background, one at a time
+      // per session.
+      turnEndQueue.run(sessionKey, async () => {
         try {
-          const runId = readField(ctx, "runId") ?? readField(event, "runId");
-          const runKey = typeof runId === "string" && runId ? runId : "";
-          if (runKey) {
-            if (seenRuns.has(runKey)) return;
-            seenRuns.add(runKey);
-            if (seenRuns.size > 500) {
-              const oldest = seenRuns.values().next().value;
-              if (oldest) seenRuns.delete(oldest);
-            }
-          }
-          const sessionKey =
-            (readField(ctx, "sessionKey") as string | undefined) ??
-            (readField(event, "sessionKey") as string | undefined) ??
-            "";
           const agentId =
             (readField(ctx, "agentId") as string | undefined) ??
             (readField(event, "agentId") as string | undefined) ??
             "";
-          if (!sessionKey || sessionKey.startsWith("cron_")) return;
           if (enabledAgents.size > 0 && agentId && !enabledAgents.has(agentId)) return;
+          // Re-read here (not at hook-fire time): an earlier queued
+          // evaluation may have paused or parked the goal meanwhile.
           const goal = getGoal(getDb(), sessionKey);
           if (!goal || goal.status !== "active") return;
           const lastResponse = extractLastAssistantText(readField(event, "messages"));
@@ -185,7 +198,7 @@ export default definePluginEntry({
         } catch {
           // Observation must never break a run.
         }
-      })();
+      });
     });
   },
 });
