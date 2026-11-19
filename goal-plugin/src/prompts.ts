@@ -160,13 +160,18 @@ export const GOAL_TOOL_DESCRIPTION =
   "after each of your replies and driven forward until it is done. " +
   "Call `get` first. Call `create` when you commit to a multi-step outcome the user wants " +
   "and no goal is set — state the outcome, not the next step, plus the acceptance criteria " +
-  "the audit will check. Call `complete` only when you can cite evidence the outcome exists; " +
-  "the completion audit refuses otherwise. " +
+  "the audit will check. Call `complete` only when you can cite evidence the outcome exists. " +
+  "Completion is validated by a reflector session (a separate session of your own agent that " +
+  "audits the claim against the criteria and the linked work): `complete` returns " +
+  "\"validation pending\" and the goal closes only if the reflector approves; a denial is " +
+  "pushed back into your session with the contradicting evidence — act on it, do not re-ask. " +
   "Never create a goal for a plain question, a one-shot answer, or work the user cancelled. " +
   "If the user redirects you and the current goal is one YOU set (source=agent), call `create` " +
   "with replace=true — do not ask the user to clear it. A user-set goal always wins " +
   "and cannot be replaced here. When you cannot act until something finishes, call `wait` " +
-  "(on=subagents|process|seconds|user) instead of replying with silence. " +
+  "(on=subagents|process|seconds|user) instead of replying with silence — waits are " +
+  "reflector-validated the same way: the park applies only on approval, and until the " +
+  "verdict lands the goal stays active, so keep working anything that is not blocked. " +
   "At the start of every turn, call `get`; if a goal is active, work its next step. " +
   "Management actions (all on your own goals only — another agent's goals are never visible): " +
   "`list` lists your non-cancelled goals; `search` (query, min 2 chars) finds goals by text " +
@@ -178,4 +183,7 @@ export const GOAL_TOOL_DESCRIPTION =
   "keep dated progress notes on the goal (update_id identifies the entry); `delete` removes " +
   "the goal row entirely — only for mistakes, requires confirm=true, and is refused for " +
   "user-set goals; finished goals should use set_status completed instead. " +
+  "`verdict` is reflector-only: a goal-reflect session records its ruling (verdict, plus " +
+  "decision=approve|deny for wait/complete requests, reason citing evidence) on the pending " +
+  "evaluation named by target_session_key + eval_id; working sessions cannot call it. " +
   "Muse's delete_briefing has no equivalent here and is not available.";

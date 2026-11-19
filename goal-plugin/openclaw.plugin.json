@@ -68,6 +68,20 @@
         "description": "Delay before the first driver scan after the gateway starts. Default 120.",
         "type": "number",
         "minimum": 0
+      },
+      "reflectorEnabled": {
+        "description": "Grade turn-ends and validate wait/complete requests in the agent's standing reflector session (agent:<agentId>:goal-reflect) instead of the one-shot judge; an agent's wait/complete is recorded as a pending request and the goal status flips only on the reflector's approving verdict. Default true.",
+        "type": "boolean"
+      },
+      "pushRoute": {
+        "description": "How pushes (continuations, nudges, denials) reach a session: 'api' = api.session.workflow.scheduleSessionTurn (in-process, gateway Cron owns the turn); 'cli' = the openclaw agent subprocess. Default 'api'.",
+        "type": "string",
+        "enum": ["api", "cli"]
+      },
+      "verdictTimeoutSeconds": {
+        "description": "Seconds a reflector evaluation may run before the one-shot judge fallback resolves it. Default 300.",
+        "type": "number",
+        "minimum": 30
       }
     },
     "type": "object"

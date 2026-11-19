@@ -95,38 +95,43 @@ test("tool: cron sessions cannot set a goal", async () => {
 });
 
 test("tool: complete refuses when the judge says not done, completes when done", async () => {
+  // Legacy synchronous path (reflector off): the one-shot judge audits
+  // complete inline. The reflector gate has its own tests
+  // (reflector-gate.test.mjs).
+  const LEGACY = { ...DEFAULT_CONFIG, reflectorEnabled: false };
   const db = memDb();
   const key = "agent:test:main";
   const stubContinue = async () => ({ verdict: "continue", reason: "not yet", parseFailed: false, transportFailed: false });
   await handleGoalAction(db, key, "test", {
     action: "create", objective: "Ship the public release and get first customers",
     acceptance_criteria: "Release live",
-  }, DEFAULT_CONFIG, stubContinue);
+  }, LEGACY, stubContinue);
   const refused = await handleGoalAction(db, key, "test", {
     action: "complete", evidence: "I did some work on the release today",
-  }, DEFAULT_CONFIG, stubContinue);
+  }, LEGACY, stubContinue);
   assert.equal(refused.ok, false);
   assert.match(String(refused.error), /refused/);
   const stubDone = async () => ({ verdict: "done", reason: "release is live", parseFailed: false, transportFailed: false });
   const done = await handleGoalAction(db, key, "test", {
     action: "complete", evidence: "Release v1.0 is live on the store: https://example.com/release",
-  }, DEFAULT_CONFIG, stubDone);
+  }, LEGACY, stubDone);
   assert.equal(done.ok, true);
   assert.equal(getGoal(db, key)?.status, "done");
   db.close();
 });
 
 test("tool: complete unverified when the judge is unreachable", async () => {
+  const LEGACY = { ...DEFAULT_CONFIG, reflectorEnabled: false };
   const db = memDb();
   const key = "agent:test:main";
   const stubOk = async () => ({ verdict: "done", reason: "ok", parseFailed: false, transportFailed: false });
   await handleGoalAction(db, key, "test", {
     action: "create", objective: "Ship the public release and get first customers",
-  }, DEFAULT_CONFIG, stubOk);
+  }, LEGACY, stubOk);
   const stubDown = async () => ({ verdict: "continue", reason: "judge error: 429", parseFailed: false, transportFailed: true });
   const r = await handleGoalAction(db, key, "test", {
     action: "complete", evidence: "Release is live on the store now",
-  }, DEFAULT_CONFIG, stubDown);
+  }, LEGACY, stubDown);
   assert.equal(r.ok, false);
   assert.match(String(r.error), /unverified/);
   assert.equal(getGoal(db, key)?.status, "active", "goal stays open");

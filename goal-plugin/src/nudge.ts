@@ -135,6 +135,16 @@ export function buildNudgePrompt(
     `Status: ${goal.status} · turns used ${goal.turnsUsed}/${goal.maxTurns} · last verdict: ${goal.lastVerdict || "-"}` +
       (goal.lastReason ? ` — ${truncate(goal.lastReason, 400)}` : ""),
   );
+  if (goal.lastDenial) {
+    lines.push(
+      `LAST REFLECTOR DENIAL: ${truncate(goal.lastDenial, 500)} — a denied wait/complete request is final for that claim: do not re-ask it; act on the evidence it cites.`,
+    );
+  }
+  if (goal.pendingRequest) {
+    lines.push(
+      `Validation pending: your ${goal.pendingRequest.kind} request ("${truncate(goal.pendingRequest.reason, 200)}") is with the reflector — the goal stays active and driven until the verdict lands.`,
+    );
+  }
   if (opts.wake === "resumed" || opts.wake === "linked-work-terminal") {
     lines.push(
       "Your goal was parked waiting on subagents. The linked work has reached a terminal state, so the goal is ACTIVE again — pick it up now.",

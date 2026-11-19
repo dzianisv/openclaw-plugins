@@ -34,6 +34,57 @@ export interface GoalEntry {
   effective_at: number;
 }
 
+/**
+ * A state-change request the agent made (wait / complete) that has NOT
+ * been applied. Since the reflector rework (2026-11-19), an agent's
+ * goal(wait|complete) no longer flips the goal's status: the request is
+ * recorded here and only the plugin applies it, after the reflector
+ * session's verdict (or the one-shot judge fallback) approves it.
+ */
+export interface PendingRequest {
+  kind: "wait" | "complete";
+  /** wait: subagents | process | seconds | user. */
+  on?: string;
+  seconds?: number;
+  processSession?: string;
+  /** wait reason / question, or the completion evidence for complete. */
+  reason: string;
+  requestedAt: number;
+}
+
+/** A reflector verdict on a pending evaluation, as written by the verdict action. */
+export interface ReflectorVerdict {
+  verdict: string;
+  reason: string;
+  /** For wait/complete requests: the explicit gate decision. */
+  decision?: "approve" | "deny";
+  blocker?: string;
+  humanCategory?: string;
+  humanDecision?: string;
+  waitForSeconds?: number;
+  at: number;
+}
+
+/**
+ * An evaluation dispatched to the agent's reflector session
+ * (`agent:<agentId>:goal-reflect`). The plugin records it when it sends
+ * the evaluation; the reflector writes `verdict` via the goal tool's
+ * verdict action; the plugin applies it when the reflector's turn ends
+ * (or when the verdict timeout fallback fires).
+ */
+export interface PendingEval {
+  evalId: string;
+  kind: "turn-end" | "wait" | "complete";
+  /** 0 while the eval is only queued on the row (the recording instance
+   * could not schedule it); set when scheduleSessionTurn accepts it. */
+  dispatchedAt: number;
+  /** When the eval was first recorded (queue-timeout clock). */
+  queuedAt?: number;
+  /** The turn response being graded (turn-end evals; truncated). */
+  response: string;
+  verdict?: ReflectorVerdict;
+}
+
 export interface GoalRow {
   sessionKey: string;
   agentId: string;
@@ -63,6 +114,12 @@ export interface GoalRow {
   waitingReason: string;
   waitingUntil: number;
   pendingHumanDecisions: string[];
+  /** Unapplied wait/complete request awaiting a reflector verdict (null = none). */
+  pendingRequest: PendingRequest | null;
+  /** Evaluation dispatched to the reflector session (null = none in flight). */
+  pendingEval: PendingEval | null;
+  /** The last reflector denial (kind + reason), quoted back by nudges. */
+  lastDenial: string;
   revision: number;
 }
 
@@ -95,6 +152,9 @@ CREATE TABLE IF NOT EXISTS goals (
   waiting_reason TEXT NOT NULL DEFAULT '',
   waiting_until INTEGER NOT NULL DEFAULT 0,
   pending_human_decisions TEXT NOT NULL DEFAULT '[]',
+  pending_request TEXT NOT NULL DEFAULT '',
+  pending_eval TEXT NOT NULL DEFAULT '',
+  last_denial TEXT NOT NULL DEFAULT '',
   revision INTEGER NOT NULL DEFAULT 1
 );
 `;
@@ -127,6 +187,16 @@ function parseJsonEntries(raw: string): GoalEntry[] {
   }
 }
 
+function parseJsonObject<T>(raw: string): T | null {
+  if (!raw) return null;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return typeof v === "object" && v !== null ? (v as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 function rowFromDb(r: Record<string, unknown>): GoalRow {
   return {
     sessionKey: String(r.session_key ?? ""),
@@ -156,6 +226,9 @@ function rowFromDb(r: Record<string, unknown>): GoalRow {
     waitingReason: String(r.waiting_reason ?? ""),
     waitingUntil: Number(r.waiting_until ?? 0),
     pendingHumanDecisions: parseJsonArray(String(r.pending_human_decisions ?? "[]")),
+    pendingRequest: parseJsonObject<PendingRequest>(String(r.pending_request ?? "")),
+    pendingEval: parseJsonObject<PendingEval>(String(r.pending_eval ?? "")),
+    lastDenial: String(r.last_denial ?? ""),
     revision: Number(r.revision ?? 1),
   };
 }
@@ -169,6 +242,13 @@ export function openRegistry(dbPath: string): DatabaseSync {
   const cols = db.prepare("PRAGMA table_info(goals)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "entries")) {
     db.exec("ALTER TABLE goals ADD COLUMN entries TEXT NOT NULL DEFAULT '[]'");
+  }
+  // Migration: reflector rework columns (2026-11-19) — pending wait/complete
+  // requests, in-flight reflector evaluations, last denial.
+  for (const col of ["pending_request", "pending_eval", "last_denial"]) {
+    if (!cols.some((c) => c.name === col)) {
+      db.exec(`ALTER TABLE goals ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
+    }
   }
   return db;
 }
@@ -190,9 +270,9 @@ export function saveGoal(db: DatabaseSync, g: GoalRow): void {
       created_at, updated_at, last_verdict, last_reason, last_response_snippet,
       consecutive_stalled, consecutive_transport_failures, consecutive_parse_failures,
       judge_outage_alerted, waiting_on, waiting_reason, waiting_until,
-      pending_human_decisions, revision
+      pending_human_decisions, pending_request, pending_eval, last_denial, revision
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     )
     ON CONFLICT(session_key) DO UPDATE SET
       agent_id=excluded.agent_id, goal=excluded.goal,
@@ -210,6 +290,8 @@ export function saveGoal(db: DatabaseSync, g: GoalRow): void {
       waiting_on=excluded.waiting_on, waiting_reason=excluded.waiting_reason,
       waiting_until=excluded.waiting_until,
       pending_human_decisions=excluded.pending_human_decisions,
+      pending_request=excluded.pending_request, pending_eval=excluded.pending_eval,
+      last_denial=excluded.last_denial,
       revision=excluded.revision`,
   ).run(
     g.sessionKey, g.agentId, g.goal, g.acceptanceCriteria, g.verification, g.userAsk,
@@ -218,7 +300,10 @@ export function saveGoal(db: DatabaseSync, g: GoalRow): void {
     g.lastVerdict, g.lastReason, g.lastResponseSnippet, g.consecutiveStalled,
     g.consecutiveTransportFailures, g.consecutiveParseFailures,
     g.judgeOutageAlerted ? 1 : 0, g.waitingOn, g.waitingReason, g.waitingUntil,
-    JSON.stringify(g.pendingHumanDecisions), g.revision,
+    JSON.stringify(g.pendingHumanDecisions),
+    g.pendingRequest ? JSON.stringify(g.pendingRequest) : "",
+    g.pendingEval ? JSON.stringify(g.pendingEval) : "",
+    g.lastDenial, g.revision,
   );
 }
 
@@ -260,6 +345,6 @@ export function newGoalRow(sessionKey: string, agentId: string): GoalRow {
     lastVerdict: "", lastReason: "", lastResponseSnippet: "",
     consecutiveStalled: 0, consecutiveTransportFailures: 0, consecutiveParseFailures: 0,
     judgeOutageAlerted: false, waitingOn: "", waitingReason: "", waitingUntil: 0,
-    pendingHumanDecisions: [], revision: 1,
+    pendingHumanDecisions: [], pendingRequest: null, pendingEval: null, lastDenial: "", revision: 1,
   };
 }

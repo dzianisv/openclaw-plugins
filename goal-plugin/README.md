@@ -21,7 +21,7 @@ openclaw plugins install --link /home/engineer/.openclaw/goal-plugin
 openclaw plugins list   # goal should be loaded
 ```
 
-No gateway restart needed (`plugins install --link` loads it live). Config lives in `plugins.entries.goal` in openclaw.json (see `openclaw.plugin.json` for the schema). The Judge model defaults to `openrouter/nvidia/nemotron-3.5-super-vl:free` (free OpenRouter tier).
+No gateway restart needed (`plugins install --link` loads it live). Config lives in `plugins.entries.goal` in openclaw.json (see `openclaw.plugin.json` for the schema). The Judge model defaults to `openai/gpt-6.1-sol` (the free deepseek model is monthly-limit-exhausted until ~Dec 3, 2026).
 
 **Reloading:** do NOT use `openclaw plugins reload goal` to load new code. The plugin's background work (Judge ~60s, push minutes) keeps it "busy", and the plugin host only waits 5s to drain — the reload fails with "Previous plugin cleanup failed" and can leave the plugin retired. Load new code with a **gateway restart** instead.
 
@@ -64,3 +64,103 @@ Muse's `delete_briefing` has no OpenClaw equivalent and is intentionally not mir
 
 - Spec: `goal-mechanism-spec.md` (Hermes goal tool + registry + Judge).
 - Hermes: `tools/goal_tool.py`, `hermes_cli/goals.py` (judge_goal:1313, evaluate_after_turn, next_continuation_prompt:2300).
+
+
+## Flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Agent as Agent (main session)
+  participant Tool as goal tool (goal-tool plugin)
+  participant Plugin as goal plugin
+  participant Registry as registry.ts → goal.db
+  participant Cron as Gateway Cron (api.session.workflow)
+  participant Reflector as Reflector session agent:AGENT:goal-reflect
+  participant Evidence as nudge.ts → gh CLI
+  alt Agent requests wait / complete
+    Agent->>Tool: goal(wait|complete, reason)
+    Tool->>Plugin: handleGoalAction(db, sessionKey, agentId, params, cfg)
+    rect rgb(253, 226, 225)
+      Plugin->>Registry: saveGoal(db, g) — pendingRequest = claim + reason. Status is NOT flipped
+    end
+    Tool-->>Agent: ToolResult "validation pending"
+    Plugin->>Cron: scheduleSessionTurn({ sessionKey: reflector key, message: evaluation prompt, delayMs: 0, tag: "goal-plugin", deliveryMode: "announce" })
+    Cron->>Reflector: Agent turn starts (session materializes on first turn)
+    rect rgb(215, 240, 215)
+      Reflector->>Registry: getGoal(db, sessionKey) — goal, criteria, pending claim
+      Reflector->>Evidence: checkLinkedWork(linkedTaskIds, 30_000) via gh issue view
+    end
+    Reflector->>Registry: Verdict written via the goal tool (approve / deny + reason)
+    Plugin->>Plugin: api.on("agent_end") — reflector session ended → read verdict
+    alt Approved
+      rect rgb(253, 226, 225)
+        Plugin->>Registry: saveGoal(db, g) — status flips (only writer)
+      end
+    else Denied
+      Plugin->>Registry: saveGoal(db, g) — lastDenial recorded
+      Plugin->>Cron: scheduleSessionTurn({ sessionKey: main session, message: denial + evidence, delayMs: 0 })
+      Cron->>Agent: New turn — rejection lands in the agent's own session
+    end
+  else Turn ends in the main session
+    Plugin->>Plugin: api.on("agent_end", (event, ctx)) — last assistant text from event.messages
+    Plugin->>Registry: saveGoal(db, g) — pendingEval recorded (queued if this instance cannot schedule)
+    Plugin->>Cron: scheduleSessionTurn({ sessionKey: reflector key, message: grade-this-turn prompt + evidence, delayMs: 0 })
+    Cron->>Reflector: Grades against criteria, with tools
+    Reflector->>Registry: Verdict via the goal tool (done / continue / blocked)
+    Plugin->>Plugin: agent_end (reflector) or the pending sweeper → verdict applied
+    rect rgb(253, 226, 225)
+      Plugin->>Registry: saveGoal(db, g) — verdict, turnsUsed + 1
+    end
+    opt Verdict = continue
+      Plugin->>Cron: scheduleSessionTurn({ sessionKey: main session, message: continuation / nudge, delayMs: 0 })
+      Cron->>Agent: New turn in the agent's own session
+    end
+  else Driver scan (periodic) / pending sweeper (20s)
+    rect rgb(215, 240, 215)
+      Plugin->>Registry: listGoals(getDb())
+      Plugin->>Evidence: checkLinkedWork(...) for waiting goals
+    end
+    opt Queued eval or undispatched request exists
+      Plugin->>Cron: scheduleSessionTurn({ sessionKey: reflector key, message: evaluation prompt, delayMs: 0 })
+    end
+    opt Waiting and allLinkedTerminal = true
+      rect rgb(253, 226, 225)
+        Plugin->>Registry: saveGoal(db, g) — status = active, waiting cleared
+      end
+      Plugin->>Cron: scheduleSessionTurn({ sessionKey: main session, message: resume nudge, delayMs: 0 })
+    end
+    Note over Plugin: Fallbacks — verdict timeout (default 300s) resolves via the one-shot judge, but a wait/complete fallback first passes a mechanical gate: linked work not terminal → deny, no judge call. A fresh request defers 90s so a sibling instance's dispatch can land before any fallback runs.
+  end
+```
+
+## Deployment: bundled placement required
+
+The plugin's pushes and reflector dispatches run through
+`api.session.workflow.scheduleSessionTurn`. In OpenClaw 2026.11.2 core
+silently refuses that call unless the plugin record's origin is
+`"bundled"` (`schedulePluginSessionTurn` returns without a job handle;
+`dist/registry-*.mjs`). Origin is path-based: plugin discovery promotes
+a candidate to `"bundled"` when its **realpath** is inside the core
+package's bundled extensions dir (`<core>/dist/extensions`), and the
+bundled root scan only accepts packages physically inside that root
+(`dist/discovery-*.mjs`, `isHostBundledPluginRoot`).
+
+Therefore, on the host:
+
+- The real plugin directories must live at
+  `<core>/dist/extensions/goal-plugin` and `<core>/dist/extensions/goal-tool`,
+  and `plugins.load.paths` in `openclaw.json` must point there.
+  A symlink from the bundled dir to an outside path does **not** work
+  (realpath escapes the root); a symlink at the legacy path
+  (`~/.openclaw/goal-plugin`) pointing **in** is fine.
+- `deliveryMode` for scheduled turns is `"announce"`: with `"none"`,
+  cron turns in channel-bound sessions fail in core's plugin-tool
+  delivery setup ("plugin delivery capability is no longer active" —
+  reproduced with a core-created job, so it is a core defect, not a
+  plugin one).
+- A core upgrade wipes `dist/extensions`. Pristine copies live outside
+  the core tree (`~/.openclaw/goal-plugin-src`, `~/.openclaw/goal-tool-src`);
+  `scripts/ensure-bundled.sh` (in this package) idempotently restores
+  the bundled copies when they are missing. Run it after every core
+  upgrade, then restart the gateway.

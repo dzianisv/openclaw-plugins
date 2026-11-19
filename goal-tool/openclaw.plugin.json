@@ -32,7 +32,7 @@
         "type": "array"
       },
       "judgeModel": {
-        "description": "Model for the Judge (one-shot call). Default openrouter/nvidia/nemotron-3.5-super-vl:free (free OpenRouter tier).",
+        "description": "Model for the Judge (one-shot call). Default openai/gpt-6.1-sol. The free deepseek model is monthly-limit-exhausted until ~Dec 3, 2026.",
         "type": "string"
       },
       "judgeTimeoutMs": {
@@ -53,6 +53,19 @@
       },
       "pushTimeoutSeconds": {
         "description": "Timeout in seconds for the push agentTurn. Default 300.",
+        "type": "number"
+      },
+      "reflectorEnabled": {
+        "description": "When true (default), wait/complete are recorded as pending requests and validated by the agent's reflector session instead of applying immediately / the one-shot judge.",
+        "type": "boolean"
+      },
+      "pushRoute": {
+        "description": "Push route shared with the goal plugin: 'api' (default) or 'cli'. Only the goal plugin pushes; this keeps the tool-side config in step.",
+        "type": "string",
+        "enum": ["api", "cli"]
+      },
+      "verdictTimeoutSeconds": {
+        "description": "Seconds a reflector evaluation may run before the one-shot judge fallback resolves it. Default 300.",
         "type": "number"
       }
     },

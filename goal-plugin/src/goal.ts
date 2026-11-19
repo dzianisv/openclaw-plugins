@@ -11,7 +11,18 @@
  *
  * Scoping: every action works on the CALLING session's goal, EXCEPT
  * list/search, which list goals visible to the caller — goals for sessions
- * of the same agent id. Another agent's goals are never exposed.
+ * of the same agent id. Another agent's goals are never exposed. The one
+ * deliberate exception is `verdict`: a reflector session
+ * (agent:<id>:goal-reflect) records its ruling on the pending evaluation
+ * of a goal owned by the SAME agent — it writes the verdict only, never
+ * the status; the plugin applies verdicts and owns status transitions.
+ *
+ * Reflector gate (2026-11-19): with cfg.reflectorEnabled, `wait` and
+ * `complete` do not change the goal's status. They record a
+ * PendingRequest on the row and return "validation pending"; the plugin
+ * dispatches the request to the agent's reflector session and applies it
+ * only on an approving verdict. The operator route (setUserGoal /
+ * goal-admin) is unaffected and still writes directly.
  *
  * User-set goals (source=user) can only be changed by the user/operator
  * (setUserGoal / goal-admin). The agent's update / set_status / delete on
@@ -34,11 +45,12 @@ import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import {
   getGoal, saveGoal, deleteGoal, listGoalsForAgent, newGoalRow, statusLine,
-  type GoalRow, type GoalEntry,
+  type GoalRow, type GoalEntry, type PendingRequest,
 } from "./registry.js";
 import { judgeGoal, type JudgeOptions } from "./judge.js";
 import { pushContinuation, type PushOptions } from "./push.js";
 import { buildContinuationPrompt } from "./prompts.js";
+import { isReflectorSession } from "./reflector.js";
 
 export const MIN_OBJECTIVE_CHARS = 12;
 export const MAX_OBJECTIVE_CHARS = 600;
@@ -55,6 +67,19 @@ export interface GoalConfig {
   nudgeEnabled: boolean;
   nudgeIntervalMinutes: number;
   nudgeInitialDelaySeconds: number;
+  /**
+   * Reflector mode (2026-11-19): turn-end grading and wait/complete
+   * validation run in the agent's standing reflector session instead of
+   * the one-shot judge, and an agent's wait/complete is recorded as a
+   * pending request — the status flips only when the plugin applies an
+   * approving verdict. When false, the legacy synchronous paths run
+   * (one-shot judge; wait/complete apply immediately).
+   */
+  reflectorEnabled: boolean;
+  /** Push route: "api" = api.session.workflow.scheduleSessionTurn; "cli" = openclaw agent subprocess. */
+  pushRoute: "api" | "cli";
+  /** Seconds a reflector evaluation may run before the one-shot judge fallback resolves it. */
+  verdictTimeoutSeconds: number;
   dryRun: boolean;
 }
 
@@ -73,6 +98,9 @@ export const DEFAULT_CONFIG: GoalConfig = {
   nudgeEnabled: true,
   nudgeIntervalMinutes: 30,
   nudgeInitialDelaySeconds: 120,
+  reflectorEnabled: true,
+  pushRoute: "api",
+  verdictTimeoutSeconds: 300,
   dryRun: false,
 };
 
@@ -102,6 +130,14 @@ export function goalView(g: GoalRow | null): Record<string, unknown> {
   if (g.subgoals.length > 0) view.subgoals = g.subgoals;
   if (g.entries.length > 0) view.entries = g.entries;
   if (g.pendingHumanDecisions.length > 0) view.pending_human_decisions = g.pendingHumanDecisions;
+  if (g.pendingRequest) {
+    view.pending_validation = {
+      kind: g.pendingRequest.kind,
+      reason: g.pendingRequest.reason,
+      requested_at: g.pendingRequest.requestedAt,
+    };
+  }
+  if (g.lastDenial) view.last_denial = g.lastDenial;
   if (g.waitingReason) view.waiting = g.waitingReason;
   view.status_line = statusLine(g);
   return view;
@@ -145,6 +181,15 @@ export interface GoalActionParams {
   description?: string;
   effective_at?: number;
   subgoals?: string[];
+  // Reflector verdict action (reflector sessions only):
+  target_session_key?: string;
+  eval_id?: string;
+  verdict?: string;
+  decision?: string;
+  blocker?: string;
+  human_category?: string;
+  human_decision?: string;
+  wait_for_seconds?: number;
 }
 
 function isCronSession(sessionKey: string): boolean {
@@ -188,6 +233,36 @@ export function setUserGoal(
   return g;
 }
 
+/**
+ * Apply a wait request to the goal row (the legacy wait mutations, shared
+ * by the direct path and by the plugin when a reflector verdict approves
+ * a pending request). Caller saves.
+ */
+export function applyWaitRequest(g: GoalRow, req: PendingRequest): void {
+  g.status = "waiting";
+  g.waitingOn = req.on || "";
+  if (req.on === "seconds") {
+    const secs = req.seconds && req.seconds > 0 ? req.seconds : 600;
+    g.waitingUntil = Date.now() + secs * 1000;
+    g.waitingReason = req.reason || `waiting ${secs}s`;
+  } else if (req.on === "process") {
+    g.waitingReason = req.reason || `waiting on process ${req.processSession || ""}`;
+  } else if (req.on === "user") {
+    g.waitingReason = req.reason;
+    g.pendingHumanDecisions = [...new Set([...g.pendingHumanDecisions, req.reason])];
+  } else {
+    g.waitingReason = req.reason || "waiting on delegated subagents";
+  }
+}
+
+/** Append an audit entry to a goal row. Caller saves. */
+export function addGoalEntry(g: GoalRow, title: string, description: string): void {
+  g.entries = [
+    ...g.entries,
+    { id: randomUUID(), title, current_state: "", description, effective_at: Date.now() },
+  ];
+}
+
 export async function handleGoalAction(
   db: DatabaseSync,
   sessionKey: string,
@@ -211,6 +286,9 @@ export async function handleGoalAction(
   if (action === "create") {
     if (isCronSession(sessionKey)) {
       return fail("cron runs are one-shot and have no goal loop; do the work in this turn instead of setting a goal");
+    }
+    if (isReflectorSession(sessionKey)) {
+      return fail("reflector sessions do not own goals; they grade other sessions' goals and record verdicts with action=verdict");
     }
     const objective = (params.objective || "").trim();
     if (objective.length < MIN_OBJECTIVE_CHARS || objective.length > MAX_OBJECTIVE_CHARS) {
@@ -277,6 +355,23 @@ export async function handleGoalAction(
     if (!g) return fail("no goal to complete");
     const evidence = (params.evidence || "").trim();
     if (evidence.length < MIN_OBJECTIVE_CHARS) return fail("complete needs evidence that the outcome exists");
+    if (cfg.reflectorEnabled) {
+      // Reflector gate (2026-11-19): a completion claim no longer closes
+      // the goal on the spot. The request is recorded; the plugin sends
+      // it to the reflector session, and the status flips only if the
+      // reflector's verdict approves it. A denial is pushed back into
+      // this session with the contradicting evidence.
+      if (g.pendingRequest) {
+        return fail(`a ${g.pendingRequest.kind} request is already awaiting validation — wait for the reflector's verdict`, goalView(g));
+      }
+      g.pendingRequest = { kind: "complete", reason: evidence, requestedAt: Date.now() };
+      saveGoal(db, g);
+      return ok({
+        validation_pending: true,
+        note: "completion recorded for reflector validation — the goal stays active until the reflector approves it; a denial will be pushed back into this session",
+        ...goalView(g),
+      });
+    }
     const decision = await runJudge({
       goal: g.goal,
       response: evidence,
@@ -304,34 +399,89 @@ export async function handleGoalAction(
     if (!g || g.status !== "active") return fail("no active goal to wait on");
     const on = (params.on || "").trim().toLowerCase();
     const reason = (params.reason || "").trim();
+    const req: PendingRequest = { kind: "wait", on, reason, requestedAt: Date.now() };
     if (on === "subagents") {
-      g.status = "waiting";
-      g.waitingOn = "subagents";
-      g.waitingReason = reason || "waiting on delegated subagents";
+      req.reason = reason || "waiting on delegated subagents";
     } else if (on === "process") {
       if (!(params.process_session || "").trim()) return fail("wait on=process needs process_session");
-      g.status = "waiting";
-      g.waitingOn = "process";
-      g.waitingReason = reason || `waiting on process ${params.process_session}`;
+      req.processSession = (params.process_session || "").trim();
+      req.reason = reason || `waiting on process ${req.processSession}`;
     } else if (on === "seconds") {
       const secs = Number(params.seconds || 0);
       if (!Number.isFinite(secs) || secs <= 0) return fail("wait on=seconds needs seconds > 0");
-      g.status = "waiting";
-      g.waitingOn = "seconds";
-      g.waitingUntil = Date.now() + secs * 1000;
-      g.waitingReason = reason || `waiting ${secs}s`;
+      req.seconds = secs;
+      req.reason = reason || `waiting ${secs}s`;
     } else if (on === "user") {
       const q = (params.question || reason || "").trim();
       if (!q) return fail("wait on=user needs a question");
-      g.status = "waiting";
-      g.waitingOn = "user";
-      g.waitingReason = q;
-      g.pendingHumanDecisions = [...new Set([...g.pendingHumanDecisions, q])];
+      req.reason = q;
     } else {
       return fail("wait needs on=subagents|process|seconds|user");
     }
+    if (cfg.reflectorEnabled) {
+      // Reflector gate (2026-11-19): the agent cannot park its own goal.
+      // The request is recorded; the plugin applies it only if the
+      // reflector session's verdict approves it. Until then the goal
+      // stays ACTIVE and keeps being driven.
+      if (g.pendingRequest) {
+        return fail(`a ${g.pendingRequest.kind} request is already awaiting validation — wait for the reflector's verdict`, goalView(g));
+      }
+      g.pendingRequest = req;
+      saveGoal(db, g);
+      return ok({
+        validation_pending: true,
+        on,
+        note: "wait recorded for reflector validation — the goal stays active until the reflector approves the park; a denial will be pushed back into this session",
+        ...goalView(g),
+      });
+    }
+    applyWaitRequest(g, req);
     saveGoal(db, g);
     return ok({ ...goalView(g), waiting: true, on });
+  }
+
+  if (action === "verdict") {
+    // Reflector-only: record the reflector session's ruling on the
+    // pending evaluation of ANOTHER session's goal (same agent). This
+    // writes the verdict onto the target goal's row; it never flips the
+    // target's status — the plugin applies verdicts when the reflector's
+    // turn ends, and it is the only writer of status transitions here.
+    if (!isReflectorSession(sessionKey)) {
+      return fail("verdict is a reflector-only action — working sessions cannot grade goals");
+    }
+    const targetKey = (params.target_session_key || "").trim();
+    const evalId = (params.eval_id || "").trim();
+    if (!targetKey || !evalId) return fail("verdict needs target_session_key and eval_id");
+    const verdictRaw = (params.verdict || "").trim().toLowerCase();
+    if (verdictRaw !== "done" && verdictRaw !== "continue" && verdictRaw !== "blocked" && verdictRaw !== "wait") {
+      return fail("verdict needs verdict=done|continue|blocked|wait");
+    }
+    const reason = (params.reason || "").trim();
+    if (!reason) return fail("verdict needs a reason citing the evidence");
+    const target = getGoal(db, targetKey);
+    if (!target) return fail(`no goal at ${targetKey}`);
+    if (target.agentId !== agentId) return fail("a reflector grades only its own agent's goals");
+    if (!target.pendingEval) return fail("no evaluation is in flight for that goal");
+    if (target.pendingEval.evalId !== evalId) {
+      return fail(`eval_id mismatch: the in-flight evaluation is ${target.pendingEval.evalId}`);
+    }
+    if (target.pendingEval.verdict) return fail("a verdict is already recorded for this evaluation");
+    const decisionRaw = (params.decision || "").trim().toLowerCase();
+    target.pendingEval = {
+      ...target.pendingEval,
+      verdict: {
+        verdict: verdictRaw,
+        reason,
+        decision: decisionRaw === "approve" ? "approve" : decisionRaw === "deny" ? "deny" : undefined,
+        blocker: (params.blocker || "").trim() || undefined,
+        humanCategory: (params.human_category || "").trim() || undefined,
+        humanDecision: (params.human_decision || "").trim() || undefined,
+        waitForSeconds: typeof params.wait_for_seconds === "number" && params.wait_for_seconds > 0 ? params.wait_for_seconds : undefined,
+        at: Date.now(),
+      },
+    };
+    saveGoal(db, target);
+    return ok({ recorded: true, target_session_key: targetKey, eval_id: evalId, verdict: verdictRaw });
   }
 
   if (action === "resume") {
@@ -547,6 +697,18 @@ export interface TurnEndDecision {
   verdict?: string;
 }
 
+/** The verdict shape the turn-end application consumes (JudgeResult is a superset). */
+export interface TurnJudgeResult {
+  verdict: string;
+  reason: string;
+  parseFailed: boolean;
+  transportFailed: boolean;
+  blocker?: string;
+  humanCategory?: string;
+  humanDecision?: string;
+  waitForSeconds?: number;
+}
+
 /**
  * The turn-end evaluation. Called from the agent_end hook. Runs the Judge
  * on the goal (ALL goals, agent goals included — the Hermes bug-2 fix),
@@ -564,10 +726,7 @@ export async function evaluateTurnEnd(
   judgeFn: (input: {
     goal: string; response: string; acceptanceCriteria?: string; verification?: string;
     userAsk?: string; subgoals?: string[]; evidence?: string;
-  }) => Promise<{
-    verdict: string; reason: string; parseFailed: boolean; transportFailed: boolean;
-    blocker?: string; humanCategory?: string; humanDecision?: string; waitForSeconds?: number;
-  }> = (input) => judgeGoal(input, judgeOpts),
+  }) => Promise<TurnJudgeResult> = (input) => judgeGoal(input, judgeOpts),
 ): Promise<TurnEndDecision> {
   if (isCronSession(sessionKey)) return { action: "skipped", reason: "cron session" };
   let g = getGoal(db, sessionKey);
@@ -619,7 +778,27 @@ export async function evaluateTurnEnd(
     };
   }
   g = fresh;
+  return applyTurnVerdict(db, g, agentId, response, judge, cfg, pushOpts);
+}
 
+/**
+ * Apply a turn-end verdict to the goal row (the post-judge half of
+ * evaluateTurnEnd, extracted so the reflector path applies verdicts
+ * through exactly the same code): transport-failure accounting, wait /
+ * blocked / done transitions, parse-failure and stall limits, the turn
+ * budget, and the continuation push. `g` must be the fresh registry row;
+ * the caller owns gating (status / revision / pending-eval checks).
+ */
+export async function applyTurnVerdict(
+  db: DatabaseSync,
+  g: GoalRow,
+  agentId: string,
+  response: string,
+  judge: TurnJudgeResult,
+  cfg: GoalConfig,
+  pushOpts: PushOptions,
+): Promise<TurnEndDecision> {
+  const sessionKey = g.sessionKey;
   if (judge.transportFailed) {
     // The judge being unreachable says nothing about the goal — but unlike
     // Hermes (which never pauses), after N consecutive outages we pause and
