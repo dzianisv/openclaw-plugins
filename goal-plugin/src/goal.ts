@@ -57,6 +57,13 @@ export const MAX_OBJECTIVE_CHARS = 600;
 
 export interface GoalConfig {
   judgeModel: string;
+  /**
+   * Models tried in order after judgeModel when the judge call fails on
+   * transport (429, timeout, CLI error). Empty means "the built-in
+   * default judge model" (see judgeOptsFor in index.ts) — a bad config
+   * override can never strand a verdict.
+   */
+  judgeFallbackModels: string[];
   judgeTimeoutMs: number;
   maxStalledTurns: number;
   maxJudgeOutages: number;
@@ -85,6 +92,10 @@ export interface GoalConfig {
 
 export const DEFAULT_CONFIG: GoalConfig = {
   judgeModel: "openrouter/nvidia/nemotron-3.5-super-vl:free",
+  // No explicit fallbacks by default: judgeOptsFor substitutes the
+  // built-in default judge model (Super-VL free) as the fallback, so a
+  // configured judgeModel that 429s still degrades to a known-good model.
+  judgeFallbackModels: [],
   // The Judge is a model call on a loaded VM (~60-70s). The agent_end hook
   // is fire-and-forget, so the Judge may run longer than the ~30s hook
   // budget — the budget bounds the await, not the background work.

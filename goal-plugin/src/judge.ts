@@ -3,12 +3,20 @@
  *
  * Route: `openclaw capability model run --agent <agentId> --model <judgeModel>
  * --prompt <prompt> --json`. A one-shot model turn, not a full agent turn.
- * The judge model is configurable; default is the agent's primary model
- * (openai/gpt-6.1-sol) because the free cheap model (opencode-go
- * deepseek-v4.1-flash) is monthly-limit-exhausted until ~Dec 3, 2026, and
- * the OpenRouter fallback 429s. The judge call is short (small prompt),
- * so it is cheap in tokens even on the primary. Switch judgeModel to
- * deepseek when its monthly limit resets.
+ * The judge model is configurable; the built-in default is
+ * openrouter/nvidia/nemotron-3.5-super-vl:free (free OpenRouter tier).
+ *
+ * Fallback chain (2026-11-20): a single-model judge dies on the first 429
+ * — on 2026-11-19 the configured judge model (opencode-go/beam-free)
+ * 429'd and every verdict came back judge_unavailable, so no goal could
+ * complete, block, or resume on evidence. judgeGoal now tries the models
+ * in order — configured judgeModel first, then each fallbackModels entry,
+ * de-duplicated — and only reports a transport failure when EVERY model
+ * fails. When no explicit fallback list is configured, the caller passes
+ * the built-in default as the fallback, so a bad config override can
+ * never strand a verdict. Parse failures are NOT retried on another
+ * model: a model that answers with garbage is a verdict problem, not a
+ * transport problem, and the fail-safe "continue" applies.
  *
  * Transport errors (CLI failure, 429, timeout) set transportFailed and
  * fail-open to "continue" — but the caller counts consecutive failures and
@@ -36,8 +44,16 @@ export interface JudgeResult {
 export interface JudgeOptions {
   agentId: string;
   judgeModel: string;
+  /** Models tried in order after judgeModel when it fails on transport. */
+  fallbackModels?: string[];
   cliPath: string;
   timeoutMs: number;
+  /**
+   * Test seam: when provided, replaces the CLI invocation for a model
+   * (receives the model id, resolves the model's raw text). Production
+   * never passes this.
+   */
+  runModel?: (model: string) => Promise<string>;
 }
 
 function runCli(cliPath: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
@@ -133,36 +149,53 @@ export function parseJudgeResponse(raw: string): {
   };
 }
 
+/** One judge attempt on one model via the openclaw CLI; throws on transport failure. */
+async function runModelViaCli(opts: JudgeOptions, model: string, prompt: string): Promise<string> {
+  const { stdout } = await runCli(
+    opts.cliPath,
+    [
+      "capability", "model", "run",
+      "--agent", opts.agentId,
+      "--model", model,
+      "--prompt", prompt,
+      "--json",
+    ],
+    opts.timeoutMs,
+  );
+  return extractModelText(stdout);
+}
+
 export async function judgeGoal(input: JudgePromptInput, opts: JudgeOptions): Promise<JudgeResult> {
   const userPrompt = buildJudgeUserPrompt(input);
   const prompt = `${JUDGE_SYSTEM_PROMPT}\n\n${userPrompt}`;
-  let raw: string;
-  try {
-    const { stdout } = await runCli(
-      opts.cliPath,
-      [
-        "capability", "model", "run",
-        "--agent", opts.agentId,
-        "--model", opts.judgeModel,
-        "--prompt", prompt,
-        "--json",
-      ],
-      opts.timeoutMs,
-    );
-    raw = extractModelText(stdout);
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    return {
-      verdict: "continue", reason: `judge error: ${reason}`,
-      parseFailed: false, transportFailed: true, raw: "",
-    };
+  // Chain: configured judge model first, then each fallback in order,
+  // de-duplicated — a model that 429s must never strand a verdict.
+  const models: string[] = [];
+  for (const m of [opts.judgeModel, ...(opts.fallbackModels ?? [])]) {
+    const t = m.trim();
+    if (t && !models.includes(t)) models.push(t);
   }
-  if (!raw.trim()) {
-    return {
-      verdict: "continue", reason: "judge returned empty output",
-      parseFailed: false, transportFailed: true, raw,
-    };
+  const failures: string[] = [];
+  for (const model of models) {
+    let raw: string;
+    try {
+      raw = opts.runModel ? await opts.runModel(model) : await runModelViaCli(opts, model, prompt);
+    } catch (err) {
+      failures.push(`${model}: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200));
+      continue;
+    }
+    if (!raw.trim()) {
+      failures.push(`${model}: empty output`);
+      continue;
+    }
+    const parsed = parseJudgeResponse(raw);
+    return { ...parsed, transportFailed: false, raw };
   }
-  const parsed = parseJudgeResponse(raw);
-  return { ...parsed, transportFailed: false, raw };
+  return {
+    verdict: "continue",
+    reason: `judge transport failed on every model (${failures.join(" | ") || "no models configured"})`,
+    parseFailed: false,
+    transportFailed: true,
+    raw: "",
+  };
 }

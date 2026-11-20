@@ -21,7 +21,7 @@ openclaw plugins install --link /home/engineer/.openclaw/goal-plugin
 openclaw plugins list   # goal should be loaded
 ```
 
-No gateway restart needed (`plugins install --link` loads it live). Config lives in `plugins.entries.goal` in openclaw.json (see `openclaw.plugin.json` for the schema). The Judge model defaults to `openai/gpt-6.1-sol` (the free deepseek model is monthly-limit-exhausted until ~Dec 3, 2026).
+No gateway restart needed (`plugins install --link` loads it live). Config lives in `plugins.entries.goal` in openclaw.json (see `openclaw.plugin.json` for the schema). The Judge model defaults to `openrouter/nvidia/nemotron-3.5-super-vl:free` (free OpenRouter tier). Judge fallback chain (0.2.2): if the configured judge model fails on transport (429, timeout, CLI error), the Judge tries each `judgeFallbackModels` entry in order; with no explicit list, the built-in default is the fallback — a single model's 429 can never strand a verdict (2026-11-19: beam-free 429'd and every verdict came back judge_unavailable).
 
 **Reloading:** do NOT use `openclaw plugins reload goal` to load new code. The plugin's background work (Judge ~60s, push minutes) keeps it "busy", and the plugin host only waits 5s to drain — the reload fails with "Previous plugin cleanup failed" and can leave the plugin retired. Load new code with a **gateway restart** instead.
 

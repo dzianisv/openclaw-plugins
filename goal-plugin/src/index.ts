@@ -55,6 +55,7 @@ import {
 
 interface PluginConfig {
   judgeModel?: string;
+  judgeFallbackModels?: string[];
   judgeTimeoutMs?: number;
   maxStalledTurns?: number;
   maxJudgeOutages?: number;
@@ -136,6 +137,9 @@ export default definePluginEntry({
     const pc = rawConfig as PluginConfig;
     const cfg: GoalConfig = {
       judgeModel: typeof pc.judgeModel === "string" && pc.judgeModel.trim() ? pc.judgeModel.trim() : DEFAULT_CONFIG.judgeModel,
+      judgeFallbackModels: Array.isArray(pc.judgeFallbackModels)
+        ? pc.judgeFallbackModels.filter((m): m is string => typeof m === "string" && !!m.trim()).map((m) => m.trim())
+        : DEFAULT_CONFIG.judgeFallbackModels,
       judgeTimeoutMs: typeof pc.judgeTimeoutMs === "number" && pc.judgeTimeoutMs > 0 ? pc.judgeTimeoutMs : DEFAULT_CONFIG.judgeTimeoutMs,
       maxStalledTurns: typeof pc.maxStalledTurns === "number" && pc.maxStalledTurns > 0 ? pc.maxStalledTurns : DEFAULT_CONFIG.maxStalledTurns,
       maxJudgeOutages: typeof pc.maxJudgeOutages === "number" && pc.maxJudgeOutages > 0 ? pc.maxJudgeOutages : DEFAULT_CONFIG.maxJudgeOutages,
@@ -165,7 +169,7 @@ export default definePluginEntry({
       return db;
     };
 
-    log(`started (judgeModel=${cfg.judgeModel}, db=${dbPath}, dryRun=${cfg.dryRun}, enabledAgents=${enabledAgents.size ? [...enabledAgents].join(",") : "all"})`);
+    log(`started (judgeModel=${cfg.judgeModel}, judgeFallbacks=[${cfg.judgeFallbackModels.length > 0 ? cfg.judgeFallbackModels.join(",") : DEFAULT_CONFIG.judgeModel}], db=${dbPath}, dryRun=${cfg.dryRun}, enabledAgents=${enabledAgents.size ? [...enabledAgents].join(",") : "all"})`);
 
     // API probe + wiring (2026-11-19): the in-process rework (API pushes +
     // the reflector session) depends on api.session.workflow.scheduleSessionTurn
@@ -407,6 +411,10 @@ export default definePluginEntry({
     const judgeOptsFor = (agentId: string): JudgeOptions => ({
       agentId,
       judgeModel: cfg.judgeModel,
+      // A configured judge model that 429s must never strand a verdict:
+      // with no explicit fallback list, the built-in default judge model
+      // (Super-VL free) is always second in line. judgeGoal de-duplicates.
+      fallbackModels: cfg.judgeFallbackModels.length > 0 ? cfg.judgeFallbackModels : [DEFAULT_CONFIG.judgeModel],
       cliPath: cfg.cliPath,
       timeoutMs: cfg.judgeTimeoutMs,
     });
