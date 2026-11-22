@@ -291,7 +291,36 @@ export async function handleGoalAction(
 
   if (action === "get") {
     const g = getGoal(db, sessionKey);
-    return ok(goalView(g));
+    if (g) return ok(goalView(g));
+    // Miss: say WHY it is missing instead of a bare null. A bare null made
+    // every supervisor tick conclude "the goal registry was wiped" (8 loss
+    // events, Nov 21–22) when the row may simply live under another session
+    // key — the live supervisor job was recreated with an unknown
+    // sessionTarget, and cron sessions cannot own goals at all. A tick
+    // cannot tell "registry empty" from "wrong session key" from a bare
+    // null, so it re-registered a fresh goal (turns reset, history lost)
+    // under whatever key it held, which the next tick under a different key
+    // could not see either. Distinguish the cases from the agent's own rows
+    // (same agent_id — never another agent's goals).
+    const siblings = listGoalsForAgent(db, agentId).filter((s) => s.status !== "cancelled");
+    if (siblings.length > 0) {
+      return ok({
+        goal: null,
+        missing_reason:
+          "no goal under this session key; this agent has goal(s) under other session key(s) — report the sibling's status, do not re-register and do not call the registry wiped",
+        sibling_goals: siblings.map(goalListView),
+        ...(isCronSession(sessionKey)
+          ? { note: "cron sessions cannot own goals; read the owner's goal in its owning session" }
+          : {}),
+      });
+    }
+    return ok({
+      goal: null,
+      missing_reason: "no goal registered for this agent in any session",
+      ...(isCronSession(sessionKey)
+        ? { note: "cron sessions cannot own goals; the owning session must set one first" }
+        : {}),
+    });
   }
 
   if (action === "create") {
